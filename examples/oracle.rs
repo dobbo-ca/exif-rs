@@ -300,14 +300,14 @@ fn gps_fields(gps: &Gps, f: &mut Vec<(String, Val<'_>)>) {
         put(
             f,
             "Composite:GPSLatitude",
-            composite_deg(gps.latitude_deg()),
+            Some(composite_deg(gps.latitude_deg(), gps.latitude_ref, b'S')),
         );
     }
     if lon.is_some() && gps.longitude_ref.is_some() {
         put(
             f,
             "Composite:GPSLongitude",
-            composite_deg(gps.longitude_deg()),
+            Some(composite_deg(gps.longitude_deg(), gps.longitude_ref, b'W')),
         );
     }
     if gps.altitude.is_some() && gps.altitude_ref.is_some() {
@@ -339,9 +339,16 @@ fn gps_fields(gps: &Gps, f: &mut Vec<(String, Val<'_>)>) {
     put(f, "GPS:GPSDateStamp", date);
 }
 
-/// A Composite GPS coordinate: a Perl number.
-fn composite_deg(d: Option<f64>) -> Option<Vec<u8>> {
-    d.filter(|d| d.is_finite()).map(|d| perl_nv(d).into_bytes())
+/// A Composite GPS coordinate (ValueConv `$val[1] =~ /^S/i ? -$val[0] : $val[0]`, `W` for the
+/// longitude), given the coordinate is present and the ref too: the degrees as a Perl number.
+/// Degrees that are not computable (a rational `x/0`) are ToDegrees' `''` on the GPS key, so the
+/// Composite is `''`, or for an `S`/`W` ref Perl's `-''`, the number -0, printed `0`.
+fn composite_deg(d: Option<f64>, r: Option<u8>, neg: u8) -> Vec<u8> {
+    match d {
+        Some(d) => perl_nv(d).into_bytes(),
+        None if r.is_some_and(|r| r.eq_ignore_ascii_case(&neg)) => b"0".to_vec(),
+        None => Vec::new(),
+    }
 }
 
 fn xmp_fields<'a>(xmp: &'a Xmp, f: &mut Vec<(String, Val<'a>)>) {

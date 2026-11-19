@@ -114,6 +114,15 @@ impl T {
         self.ent(tag, 5, v.len() as u32, d)
     }
 
+    fn srational(&self, tag: u16, v: &[(i32, i32)]) -> Ent {
+        let d = v
+            .iter()
+            .flat_map(|(n, d)| [self.u32(*n as u32), self.u32(*d as u32)])
+            .flatten()
+            .collect();
+        self.ent(tag, 10, v.len() as u32, d)
+    }
+
     fn undefined(&self, tag: u16, v: &[u8]) -> Ent {
         self.ent(tag, 7, v.len() as u32, v.to_vec())
     }
@@ -757,6 +766,83 @@ fn exposure_and_pixel_size_variants() {
     assert_eq!(x.pixel_size(), Some((10, 20)));
     let data = tiff_sub(0x8769, |t| vec![t.short(0xA002, &[10])]);
     assert_eq!(parse(&data, &lim()).unwrap().pixel_size(), None);
+}
+
+/// ExifTool reads a number of any type: Issue 313 (dotnet) stores ExposureTime and FocalLength as
+/// SRATIONAL and ISO as SLONG, OnePlus8 ExposureTime as SRATIONAL.
+#[test]
+fn exposure_takes_signed_and_integer_types() {
+    let r = |num, den| Some(Rational { num, den });
+    let data = tiff_sub(0x8769, |t| {
+        vec![
+            t.srational(0x829A, &[(1, 255)]),
+            t.short(0x829D, &[2]),
+            t.ent(0x8827, 9, 1, t.u32(50).to_vec()),
+            t.srational(0x920A, &[(-43, -10)]),
+            t.ent(0xA002, 8, 1, t.u16(10).to_vec()),
+            t.ent(0xA003, 6, 1, vec![20]),
+        ]
+    });
+    let x = parse(&data, &lim()).unwrap();
+    let ex = x.exposure();
+    assert_eq!(ex.exposure_time, r(1, 255));
+    assert_eq!(ex.f_number, r(2, 1));
+    assert_eq!(ex.iso, Some(50));
+    assert_eq!(ex.focal_length, r(43, 10));
+    assert_eq!(x.pixel_size(), Some((10, 20)));
+
+    // A negative value is not an unsigned rational; x/0 stays x/0 (ExifTool: inf).
+    let data = tiff_sub(0x8769, |t| {
+        vec![
+            t.srational(0x829A, &[(-1, 255)]),
+            t.srational(0x829D, &[(-5, 0)]),
+            t.ent(0x8827, 9, 1, t.u32(-50i32 as u32).to_vec()),
+            t.srational(0x920A, &[(0, -10)]),
+            t.ent(0xA002, 11, 1, t.u32(10f32.to_bits()).to_vec()),
+        ]
+    });
+    let x = parse(&data, &lim()).unwrap();
+    let ex = x.exposure();
+    assert_eq!(ex.exposure_time, None);
+    assert_eq!(ex.f_number, r(5, 0));
+    assert_eq!(ex.iso, None);
+    assert_eq!(ex.focal_length, r(0, 10));
+    assert_eq!(x.pixel_size(), None);
+}
+
+/// FLIR Vue Pro 640 stores GPSLatitude, GPSLongitude and GPSAltitude as SRATIONAL zeros.
+#[test]
+fn gps_takes_signed_and_integer_types() {
+    let r = |num, den| Rational { num, den };
+    let data = tiff_sub(0x8825, |t| {
+        vec![
+            t.ascii(0x0001, "S"),
+            t.srational(0x0002, &[(0, 1), (0, 1), (0, 1)]),
+            t.ascii(0x0003, "W"),
+            t.srational(0x0004, &[(10, 1), (30, 1), (-1, -2)]),
+            t.byte(0x0005, &[0]),
+            t.srational(0x0006, &[(0, 1)]),
+            t.short(0x0007, &[15, 29, 41]),
+        ]
+    });
+    let g = parse(&data, &lim()).unwrap().gps().unwrap();
+    assert_eq!(g.latitude, Some([r(0, 1); 3]));
+    assert_eq!(g.latitude_deg(), Some(0.0));
+    assert_eq!(g.longitude, Some([r(10, 1), r(30, 1), r(1, 2)]));
+    assert_eq!(
+        g.longitude_deg(),
+        Some(-(10.0 + (30.0 + 0.5 / 60.0) / 60.0))
+    );
+    assert_eq!(g.altitude, Some(r(0, 1)));
+    assert_eq!(g.altitude_m(), Some(0.0));
+    assert_eq!(g.time_stamp, Some([r(15, 1), r(29, 1), r(41, 1)]));
+
+    // One negative part: no coordinate.
+    let data = tiff_sub(0x8825, |t| {
+        vec![t.srational(0x0002, &[(1, 1), (-2, 1), (0, 1)])]
+    });
+    let g = parse(&data, &lim()).unwrap().gps().unwrap();
+    assert_eq!(g.latitude, None);
 }
 
 #[test]

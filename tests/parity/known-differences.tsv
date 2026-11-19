@@ -1,1 +1,2 @@
 # file	key	reason (tab-separated; compare.py skips lines starting with #). Empty: the goal is zero.
+mei__png_Issue_204_(dotnet).png	XMP-xmp:CreateDate	packet starts with a UTF-8 BOM and <?xml : ExifTool ProcessXMP decodes it as UTF-16LE (fmt v for any BOM but FEFF), finds no XMP (Empty XMP); exif-rs reads the UTF-8 packet (docs/parity.md)

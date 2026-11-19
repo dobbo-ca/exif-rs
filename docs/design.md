@@ -93,6 +93,8 @@ pub struct CaptureTime {
     pub offset: Option<String>,       // Exif 0x9011 OffsetTimeOriginal
 }
 pub struct Exposure {
+    // the Rational fields (here and in Gps) also take a non-negative SRATIONAL (signs dropped)
+    // or an integer (n/1); iso and pixel_size any non-negative integer type: ExifTool reads any type
     pub exposure_time: Option<Rational>,  // Exif 0x829A
     pub f_number: Option<Rational>,       // Exif 0x829D
     pub iso: Option<u32>,                 // Exif 0x8827 (first value)

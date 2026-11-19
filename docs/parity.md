@@ -111,8 +111,13 @@ Value conversion (ExifTool.pm `ReadValue`, Exif.pm, GPS.pm, XMP.pm):
 - GPSDateStamp has `Format => 'undef'` (the stored bytes whatever the type, `s/\0+$//`); the
   oracle takes `Gps::date_stamp` (ASCII up to the first NUL), then `Exif::ExifDate`:
   `s/(\d{4})[^\d]*(\d{2})[^\d]*(\d{2})$/$1:$2:$3/`.
-- Composite:GPSLatitude/GPSLongitude (`Require` GPS:GPSLatitude and its ref): `Gps::latitude_deg`
-  as a Perl number; no key when it is `None`.
+- Composite:GPSLatitude/GPSLongitude (`Require` GPS:GPSLatitude and its ref, ValueConv
+  `$val[1] =~ /^S/i ? -$val[0] : $val[0]`, `W` for the longitude): built when `Gps::latitude` and
+  `latitude_ref` are both `Some`; `Gps::latitude_deg` as a Perl number. When `latitude_deg` is
+  `None` (a rational `x/0`: ExifTool's GPS:GPSLatitude is ToDegrees' `''`, which `Require` still
+  counts as present) the Composite is `''`, or, for an `S`/`W` ref, Perl's `-''`: the number -0,
+  printed `0` (no corpus file has that case). InfiRay, Leica T, Nikon D5000, Olympus SH-1,
+  OnePlus8 have `0/0` coordinates.
 - Composite:GPSAltitude (`Desire` the altitude and its ref, needs the ref): `Gps::altitude_m`,
   with ref 0 the GPS:GPSAltitude text (`%.10g`), else `-abs(value)` printed as a Perl number; no
   key when it is `None`. The XMP GPSAltitude fallback of the same Composite is not reproduced.
@@ -170,13 +175,24 @@ JSON writing (the `exiftool` script, `EscapeJSON` and `ConvertBinary`):
 These follow the exif-rs API on purpose; a mismatch they cause goes in `known-differences.tsv`
 with the reason:
 
-- The typed accessors read typed values: `Gps::latitude`/`longitude`/`time_stamp` and
-  `latitude_deg`/`longitude_deg` need RATIONAL[3] (and finite parts for the degrees),
-  `altitude`/`altitude_m` and the exposure values a RATIONAL, `iso` and `pixel_size` a SHORT or
-  LONG (`iso` the first value: ExifTool prints `100 200` for two), the strings ASCII (or EXIF 3.0
-  UTF-8) that is valid UTF-8, the GPS refs their first byte (`altitude_ref` as a number: an ASCII
-  `"0"` is 48), `orientation` the first value of an integer type. ExifTool reads any type, so
-  such a value is a mismatch (no key on the exif-rs side).
+- The typed accessors read typed values: `Gps::latitude`/`longitude`/`time_stamp` need three
+  values and `altitude` and the exposure values one, each a RATIONAL, an SRATIONAL that is not
+  negative (FLIR Vue Pro 640 GPS, Issue 313 ExposureTime and FocalLength, OnePlus8
+  ExposureTime) or an integer type (as `n/1`), and finite parts for
+  `latitude_deg`/`longitude_deg`/`altitude_m`; FLOAT, DOUBLE, strings and negative values give
+  `None`. `iso` and `pixel_size` take any integer type that is not negative (Issue 313 ISO is an
+  SLONG; `iso` the first value: ExifTool prints `100 200` for two), the strings ASCII (or EXIF
+  3.0 UTF-8) that is valid UTF-8, the GPS refs their first byte (`altitude_ref` as a number: an
+  ASCII `"0"` is 48), `orientation` the first value of an integer type. ExifTool reads any type,
+  so such a value is a mismatch (no key on the exif-rs side).
+- An XMP packet that starts with a UTF-8 BOM and `<?xml ` is parsed. ExifTool's `ProcessXMP`
+  takes a BOM followed by `<?xml ` as UTF-16/32 XML and picks the decoding from the BOM bytes,
+  where only `\xfe\xff` means big-endian; every other BOM, the UTF-8 one included, gives `'v'`
+  (UTF-16LE). The UTF-8 packet decoded as UTF-16LE has no markup, so ExifTool warns `[minor]
+  Empty XMP` and gives no XMP-* tag (XMP:XMP, extracted before the decoding, still matches).
+  Copying that would leave a valid UTF-8 packet unread (Issue 204: a PNG `Raw profile type
+  xmp` zTXt whose packet starts `\xef\xbb\xbf<?xml version=`; ExifTool's PNG:Xmp* tags come
+  from separate tEXt chunks).
 - `CaptureTime` needs DateTimeOriginal: without it there is no SubSecTimeOriginal or
   OffsetTimeOriginal key either.
 - `Exif::capture_time` reads the Exif IFD only; ExifTool's Composite also takes an IFD0
@@ -244,4 +260,5 @@ Lists: `read-mismatches.tsv` (file, key, ExifTool value, oracle value, as type a
 
 ## Known differences
 
-None yet (`tests/parity/known-differences.tsv` is empty).
+`tests/parity/known-differences.tsv` lists `mei__png_Issue_204_(dotnet).png` `XMP-xmp:CreateDate`:
+the UTF-8 BOM `<?xml` packet above.

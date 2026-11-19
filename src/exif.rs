@@ -5,7 +5,9 @@
 //! `SubSecTimeOriginal` loses trailing spaces, the other strings are returned as stored. A
 //! string that is not valid UTF-8 gives `None`. Of two entries with the same tag in one IFD the
 //! accessors read the last one, as ExifTool keeps the last (priority 1); IFD0 Orientation
-//! (priority 0) is the first.
+//! (priority 0) is the first. The rational accessors take a RATIONAL, an SRATIONAL that is not
+//! negative or an integer (ExifTool reads a number of any type); the integer ones (ISO, pixel
+//! size) any integer type that is not negative.
 
 use std::sync::atomic::AtomicBool;
 
@@ -136,7 +138,7 @@ pub struct Exposure {
     pub exposure_time: Option<Rational>,
     /// Exif 0x829D.
     pub f_number: Option<Rational>,
-    /// Exif 0x8827 (first value, SHORT or LONG).
+    /// Exif 0x8827 (first value, any integer type).
     pub iso: Option<u32>,
     /// Exif 0x920A.
     pub focal_length: Option<Rational>,
@@ -221,6 +223,37 @@ impl Gps {
         } else {
             a
         })
+    }
+}
+
+/// Value `i` of an integer entry (BYTE, SHORT, LONG, SBYTE, SSHORT, SLONG); `None` for another
+/// type or a negative value.
+fn uint_at(v: &Value, i: usize) -> Option<u32> {
+    match v {
+        Value::Byte(v) => v.get(i).map(|&x| u32::from(x)),
+        Value::Short(v) => v.get(i).map(|&x| u32::from(x)),
+        Value::Long(v) => v.get(i).copied(),
+        Value::SByte(v) => v.get(i).and_then(|&x| u32::try_from(x).ok()),
+        Value::SShort(v) => v.get(i).and_then(|&x| u32::try_from(x).ok()),
+        Value::SLong(v) => v.get(i).and_then(|&x| u32::try_from(x).ok()),
+        _ => None,
+    }
+}
+
+/// Value `i` of an entry as an unsigned rational: a RATIONAL as stored, an SRATIONAL that is not
+/// negative with its signs dropped (`x/0` stays `x/0`: ExifTool reads `-5/0` as `inf` too), an
+/// integer ([`uint_at`]) as `n/1`. `None` for FLOAT, DOUBLE, the byte strings and a negative value.
+fn rational_at(v: &Value, i: usize) -> Option<Rational> {
+    match v {
+        Value::Rational(v) => v.get(i).copied(),
+        Value::SRational(v) => v
+            .get(i)
+            .filter(|r| r.num == 0 || r.den == 0 || (r.num > 0) == (r.den > 0))
+            .map(|r| Rational {
+                num: r.num.unsigned_abs(),
+                den: r.den.unsigned_abs(),
+            }),
+        _ => uint_at(v, i).map(|num| Rational { num, den: 1 }),
     }
 }
 
@@ -363,28 +396,16 @@ impl Exif {
     }
 
     fn rational(&self, ifd: IfdKind, tag: u16) -> Option<Rational> {
-        match self.last(ifd, tag)? {
-            Value::Rational(v) => v.first().copied(),
-            _ => None,
-        }
+        rational_at(self.last(ifd, tag)?, 0)
     }
 
     fn rationals3(&self, ifd: IfdKind, tag: u16) -> Option<[Rational; 3]> {
-        match self.last(ifd, tag)? {
-            Value::Rational(v) => match v.as_slice() {
-                [a, b, c, ..] => Some([*a, *b, *c]),
-                _ => None,
-            },
-            _ => None,
-        }
+        let v = self.last(ifd, tag)?;
+        Some([rational_at(v, 0)?, rational_at(v, 1)?, rational_at(v, 2)?])
     }
 
     fn uint(&self, ifd: IfdKind, tag: u16) -> Option<u32> {
-        match self.last(ifd, tag)? {
-            Value::Short(v) => v.first().map(|&x| u32::from(x)),
-            Value::Long(v) => v.first().copied(),
-            _ => None,
-        }
+        uint_at(self.last(ifd, tag)?, 0)
     }
 
     fn first_byte(&self, ifd: IfdKind, tag: u16) -> Option<u8> {
@@ -404,7 +425,8 @@ impl Exif {
         }
     }
 
-    /// PixelXDimension (0xA002) and PixelYDimension (0xA003), SHORT or LONG; both must be present.
+    /// PixelXDimension (0xA002) and PixelYDimension (0xA003), any integer type; both must be
+    /// present.
     pub fn pixel_size(&self) -> Option<(u32, u32)> {
         Some((
             self.uint(IfdKind::Exif, 0xA002)?,
