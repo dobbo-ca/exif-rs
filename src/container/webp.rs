@@ -264,7 +264,7 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
             exif = Some(c);
         } else if (c.kind == *b"XMP " || c.kind == *b"XMP\0") && !xmp_seen {
             xmp_seen = true;
-            if let Some(r) = xmp_span(c.data(data), limits) {
+            if let Some(r) = xmp_span(c.data(data), limits, budget)? {
                 xmp = Some((c, c.dstart + r.start..c.dstart + r.end));
             }
         }

@@ -298,6 +298,111 @@ fn max_alloc_smaller_than_data_is_alloc_error() {
     }
 }
 
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// A zlib stream of stored (uncompressed) deflate blocks.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = data.chunks(65535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        v.push(u8::from(i + 1 == blocks.len()));
+        let n = b.len() as u16;
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&(!n).to_le_bytes());
+        v.extend_from_slice(b);
+    }
+    v.extend_from_slice(&adler32(data).to_be_bytes());
+    v
+}
+
+// The inflate buffer grows by doubling, so an iCCP profile just past a doubling leaves up to as
+// much spare capacity as it has bytes. That capacity is charged, so what the call reads after it
+// (here a 120 000-byte eXIf block) cannot take the real peak past max_alloc.
+#[test]
+fn inflated_chunk_capacity_is_charged() {
+    let _g = lock();
+    let profile = vec![0u8; 2 * 65535 + 3];
+    let mut iccp = b"icc\0\0".to_vec();
+    iccp.extend(zlib_stored(&profile));
+    let mut exif_block = tiff(50, 0);
+    exif_block.resize(120_000, 0);
+    let mut data = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let ihdr = [
+        &1u32.to_be_bytes()[..],
+        &1u32.to_be_bytes(),
+        &[8, 0, 0, 0, 0],
+    ]
+    .concat();
+    data.extend(chunk(b"IHDR", &ihdr));
+    data.extend(chunk(b"iCCP", &iccp));
+    data.extend(chunk(b"eXIf", &exif_block));
+    data.extend(chunk(b"IDAT", &[0x55; 64]));
+    data.extend(chunk(b"IEND", &[]));
+    let lim = limits(256 << 10, 1);
+    let (r, peak) = measured(|| exif::read(&data, &lim, &no_cancel()));
+    let meta = r.unwrap_or_else(|e| panic!("read: {e}"));
+    assert_eq!(meta.raw.icc.as_ref().map(Vec::len), Some(profile.len()));
+    assert!(meta.exif.is_some());
+    within("read png with iCCP", peak, lim.max_alloc);
+}
+
+// The XMP element stack keeps its capacity after the elements close; that capacity stays
+// charged, so properties that follow cannot take the real peak past max_alloc. Each of the 300
+// properties copies a 4 KiB namespace URI (1.2 MB in all, over the 1 MiB budget).
+#[test]
+fn xmp_stack_capacity_stays_charged() {
+    let _g = lock();
+    let mut s = String::from(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+         <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+         <rdf:Description xmlns:a=\"http://a/\">",
+    );
+    s.push_str(&"<a:p>".repeat(4096));
+    s.push_str(&"</a:p>".repeat(4096));
+    let _ = write!(
+        s,
+        "</rdf:Description><rdf:Description xmlns:b=\"http://b/{}\"",
+        "u".repeat(4096)
+    );
+    for i in 0..300 {
+        let _ = write!(s, " b:k{i}=\"\"");
+    }
+    s.push_str("/></rdf:RDF></x:xmpmeta>");
+    let lim = limits(1 << 20, 1);
+    let (r, peak) = measured(|| exif::Xmp::parse(s.as_bytes(), None, &lim, &no_cancel()));
+    assert_eq!(r, Err(Error::LimitExceeded(Limit::Alloc)));
+    within("xmp nested then many properties", peak, lim.max_alloc);
+}
+
+// reset_orientation charges its output and its XMP scan.
+#[test]
+fn reset_orientation_peak_within_max_alloc() {
+    let _g = lock();
+    let inputs = [
+        ("jpeg", jpeg(&tiff(50, 0), &xmp(20), 64 << 10)),
+        ("png", png(&tiff(50, 0), &xmp(1000))),
+    ];
+    for max_alloc in [64 << 10, 1 << 20] {
+        let lim = limits(max_alloc, 1);
+        for (name, data) in &inputs {
+            let (r, peak) = measured(|| exif::reset_orientation(data, &lim, &no_cancel()));
+            assert!(
+                r.is_ok() || r == Err(Error::LimitExceeded(Limit::Alloc)),
+                "{name} at {max_alloc}: {:?}",
+                r.map(|_| ())
+            );
+            within(&format!("{name} reset at {max_alloc}"), peak, max_alloc);
+        }
+    }
+}
+
 // The crate spawns no thread, so max_threads 1 and 4 give the same result. This compares results;
 // the no-spawn claim itself is `src_spawns_no_thread` below.
 #[test]

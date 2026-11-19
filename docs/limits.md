@@ -37,11 +37,20 @@ per public call (`read` makes one `Budget` for the container, EXIF and XMP stage
   charged until the call returns.
 - `Budget::remaining()` is passed down to nested calls: PNG inflate runs with
   `deflate::zlib::decode_limit` under the remaining budget, `max_exif_bytes` and `max_xmp_bytes`.
+  The decoder grows its buffer by doubling, so the whole capacity it returns is charged; the
+  buffer is then shrunk to the output and the rest given back.
+- The XMP element and namespace stacks charge the capacity they grow by, and keep it charged
+  until the scan ends (a `Vec` does not shrink when elements close).
+- `strip` with `keep.orientation` gives back what its parse of the EXIF block charged once the
+  orientation is read (`Budget::used` / `reset_to`).
 
 What is charged: copies of the EXIF, XMP and ICC blocks, parsed entry lists and values, XMP
-property strings, inflated PNG text, the output buffer of `strip` and `reset_orientation`. What is
-not: small fixed-size allocations that do not scale with the input. `tests/resources.rs` measures
-the real peak with a counting allocator and asserts it stays within `max_alloc` plus a fixed slack.
+property strings and stacks, inflated PNG text, the output buffer of `strip` and
+`reset_orientation`, and the XMP scan of `reset_orientation`. What is not: small fixed-size
+allocations that do not scale with the input. `tests/resources.rs` measures the real peak with a
+counting allocator and asserts it stays within `max_alloc` plus a fixed slack, for `read`, `strip`
+and `reset_orientation`, a PNG whose iCCP inflates just past a doubling, and an XMP packet that
+nests deep, closes, then fills the budget.
 
 ## Cancel
 

@@ -18,10 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::{env, fs, io, process};
 
-use exif::{ByteOrder, CaptureTime, Exif, IfdKind, Keep, Limits, Metadata, Value, Xmp};
+use exif::{CaptureTime, Exif, Gps, Keep, Limits, Metadata, Rational, Xmp};
 
 const NS_TIFF: &str = "http://ns.adobe.com/tiff/1.0/";
-const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
 /// ExifTool's hdrgm tags that are lists (`List => 'Seq'`).
 const HDRGM_LISTS: [&str; 5] = [
     "OffsetSDR",
@@ -221,98 +220,107 @@ fn kodak_patch(ex: Option<&Exif>, block: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A rational as ExifTool reads it, as bytes.
+fn rat(r: Rational) -> Vec<u8> {
+    rational(i64::from(r.num), i64::from(r.den)).into_bytes()
+}
+
+/// Rationals as ExifTool reads several values of one entry: joined with a space.
+fn rats(c: &[Rational]) -> Vec<u8> {
+    c.iter()
+        .map(|r| rational(i64::from(r.num), i64::from(r.den)))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into_bytes()
+}
+
+fn num(n: impl ToString) -> Vec<u8> {
+    n.to_string().into_bytes()
+}
+
+fn text(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+/// Every value comes from the public accessor that claims its key; the oracle only formats it as
+/// ExifTool prints it. An accessor that gives `None` gives no key, so a value ExifTool reads and
+/// the accessor does not is a mismatch.
 fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
-    // ExifTool keeps the last of two equal tags in one IFD (priority 1), except for tags with
-    // priority 0 (IFD0 Orientation), where the first one stays.
-    let last = move |ifd: IfdKind, tag: u16| {
-        ex.entries(ifd)
-            .iter()
-            .rev()
-            .find(|e| e.tag == tag)
-            .map(|e| &e.value)
-    };
-    let first = move |ifd: IfdKind, tag: u16| {
-        ex.entries(ifd)
-            .iter()
-            .find(|e| e.tag == tag)
-            .map(|e| &e.value)
-    };
-    let trim_space = |v: &Value| perl_strip_end(&read_value(v), is_perl_space);
+    put(f, "IFD0:Orientation", ex.orientation().map(num));
+    put(f, "IFD0:Make", ex.make().map(text));
+    put(f, "IFD0:Model", ex.model().map(text));
 
-    put(
-        f,
-        "IFD0:Orientation",
-        first(IfdKind::Ifd0, 0x0112).map(read_value),
-    );
-    put(f, "IFD0:Make", last(IfdKind::Ifd0, 0x010F).map(trim_space));
-    put(f, "IFD0:Model", last(IfdKind::Ifd0, 0x0110).map(trim_space));
-
-    let e = IfdKind::Exif;
-    for (key, tag) in [
-        ("ExifIFD:DateTimeOriginal", 0x9003),
-        ("ExifIFD:OffsetTimeOriginal", 0x9011),
-        ("ExifIFD:ExposureTime", 0x829A),
-        ("ExifIFD:FNumber", 0x829D),
-        ("ExifIFD:ISO", 0x8827),
-        ("ExifIFD:FocalLength", 0x920A),
-        ("ExifIFD:ExifImageWidth", 0xA002),
-        ("ExifIFD:ExifImageHeight", 0xA003),
-        ("ExifIFD:LensMake", 0xA433),
-        ("ExifIFD:LensModel", 0xA434),
-    ] {
-        put(f, key, last(e, tag).map(read_value));
+    if let Some(ct) = ex.capture_time() {
+        put(f, "ExifIFD:DateTimeOriginal", Some(text(&ct.date_time)));
+        put(
+            f,
+            "ExifIFD:SubSecTimeOriginal",
+            ct.subsec.as_deref().map(text),
+        );
+        put(
+            f,
+            "ExifIFD:OffsetTimeOriginal",
+            ct.offset.as_deref().map(text),
+        );
+        put(
+            f,
+            "Composite:SubSecDateTimeOriginal",
+            sub_sec_date_time(&ct),
+        );
     }
-    put(
-        f,
-        "ExifIFD:SubSecTimeOriginal",
-        last(e, 0x9291).map(|v| perl_strip_end(&read_value(v), |b| b == b' ')),
-    );
-
-    let g = IfdKind::Gps;
-    let lat_ref = last(g, 0x0001).map(read_value);
-    let lat = last(g, 0x0002).map(|v| to_degrees(&read_value(v)));
-    let lon_ref = last(g, 0x0003).map(read_value);
-    let lon = last(g, 0x0004).map(|v| to_degrees(&read_value(v)));
-    let alt_ref = last(g, 0x0005).map(read_value);
-    let alt = last(g, 0x0006).map(read_value);
-    let time = last(g, 0x0007).and_then(|v| convert_time_stamp(&read_value(v)));
-    // GPSDateStamp is read as `undef` whatever its type, then trailing NULs go, then ExifDate.
-    let date = last(g, 0x001D).map(|v| {
-        exif_date(&perl_strip_end(&stored_bytes(v, ex.byte_order()), |b| {
-            b == 0
-        }))
-    });
+    let x = ex.exposure();
+    put(f, "ExifIFD:ExposureTime", x.exposure_time.map(rat));
+    put(f, "ExifIFD:FNumber", x.f_number.map(rat));
+    put(f, "ExifIFD:ISO", x.iso.map(num));
+    put(f, "ExifIFD:FocalLength", x.focal_length.map(rat));
+    if let Some((w, h)) = ex.pixel_size() {
+        put(f, "ExifIFD:ExifImageWidth", Some(num(w)));
+        put(f, "ExifIFD:ExifImageHeight", Some(num(h)));
+    }
+    put(f, "ExifIFD:LensMake", ex.lens_make().map(text));
+    put(f, "ExifIFD:LensModel", ex.lens_model().map(text));
 
     if let Some(gps) = ex.gps() {
-        // The Gps API value when it has one (RATIONAL coordinates); else ExifTool's ValueConv on
-        // the GPS texts (any type, and '' from ToDegrees for inf/undef parts).
-        if let (Some(l), Some(r)) = (&lat, &lat_ref) {
-            let v =
-                composite_deg(gps.latitude_deg()).unwrap_or_else(|| composite_coord(l, r, b'S'));
-            put(f, "Composite:GPSLatitude", Some(v));
-        }
-        if let (Some(l), Some(r)) = (&lon, &lon_ref) {
-            let v =
-                composite_deg(gps.longitude_deg()).unwrap_or_else(|| composite_coord(l, r, b'W'));
-            put(f, "Composite:GPSLongitude", Some(v));
-        }
-        if let (Some(a), Some(r)) = (&alt, &alt_ref) {
-            // ExifTool returns GPSAltitude's own %.10g text when the ref is 0, else the number
-            // -abs(value), which Perl prints with %.15g.
-            let text = |a: f64| {
-                if a.is_sign_negative() {
-                    perl_nv(a)
-                } else {
-                    fmt_g(a, 10)
-                }
-            };
-            let v = gps
-                .altitude_m()
-                .filter(|a| a.is_finite())
-                .map(|a| text(a).into_bytes())
-                .or_else(|| composite_altitude(a, r));
-            put(f, "Composite:GPSAltitude", v);
-        }
+        gps_fields(&gps, f);
+    }
+    if let Some(t) = ex.thumbnail().filter(|t| !t.is_empty()) {
+        f.push(("IFD1:ThumbnailImage".into(), Val::Binary(t)));
+    }
+}
+
+fn gps_fields(gps: &Gps, f: &mut Vec<(String, Val<'_>)>) {
+    let lat = gps.latitude.map(|c| to_degrees(&rats(&c)));
+    let lon = gps.longitude.map(|c| to_degrees(&rats(&c)));
+    let time = gps.time_stamp.and_then(|c| convert_time_stamp(&rats(&c)));
+    let date = gps.date_stamp.as_deref().map(|d| exif_date(d.as_bytes()));
+
+    // Composite GPSLatitude/GPSLongitude need the coordinate and its ref; GPSAltitude the
+    // altitude and its ref.
+    if lat.is_some() && gps.latitude_ref.is_some() {
+        put(
+            f,
+            "Composite:GPSLatitude",
+            composite_deg(gps.latitude_deg()),
+        );
+    }
+    if lon.is_some() && gps.longitude_ref.is_some() {
+        put(
+            f,
+            "Composite:GPSLongitude",
+            composite_deg(gps.longitude_deg()),
+        );
+    }
+    if gps.altitude.is_some() && gps.altitude_ref.is_some() {
+        // ExifTool returns GPSAltitude's own %.10g text when the ref is 0, else the number
+        // -abs(value), which Perl prints with %.15g.
+        let v = gps.altitude_m().filter(|a| a.is_finite()).map(|a| {
+            if a.is_sign_negative() {
+                perl_nv(a).into_bytes()
+            } else {
+                fmt_g(a, 10).into_bytes()
+            }
+        });
+        put(f, "Composite:GPSAltitude", v);
     }
     if let (Some(d), Some(t)) = (&date, &time) {
         let mut v = d.clone();
@@ -321,25 +329,14 @@ fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
         v.push(b'Z');
         put(f, "Composite:GPSDateTime", Some(v));
     }
-    put(f, "GPS:GPSLatitudeRef", lat_ref);
+    put(f, "GPS:GPSLatitudeRef", gps.latitude_ref.map(|r| vec![r]));
     put(f, "GPS:GPSLatitude", lat);
-    put(f, "GPS:GPSLongitudeRef", lon_ref);
+    put(f, "GPS:GPSLongitudeRef", gps.longitude_ref.map(|r| vec![r]));
     put(f, "GPS:GPSLongitude", lon);
-    put(f, "GPS:GPSAltitudeRef", alt_ref);
-    put(f, "GPS:GPSAltitude", alt);
+    put(f, "GPS:GPSAltitudeRef", gps.altitude_ref.map(num));
+    put(f, "GPS:GPSAltitude", gps.altitude.map(rat));
     put(f, "GPS:GPSTimeStamp", time);
     put(f, "GPS:GPSDateStamp", date);
-
-    if let Some(ct) = ex.capture_time() {
-        put(
-            f,
-            "Composite:SubSecDateTimeOriginal",
-            sub_sec_date_time(&ct),
-        );
-    }
-    if let Some(t) = ex.thumbnail().filter(|t| !t.is_empty()) {
-        f.push(("IFD1:ThumbnailImage".into(), Val::Binary(t)));
-    }
 }
 
 /// A Composite GPS coordinate: a Perl number.
@@ -347,80 +344,21 @@ fn composite_deg(d: Option<f64>) -> Option<Vec<u8>> {
     d.filter(|d| d.is_finite()).map(|d| perl_nv(d).into_bytes())
 }
 
-/// ExifTool's Composite GPSLatitude/GPSLongitude ValueConv on the GPS texts:
-/// `$ref =~ /^S/i ? -$deg : $deg` (`W` for longitude). Perl's `-''` and `-"0"` are `0`.
-fn composite_coord(deg: &[u8], r: &[u8], neg: u8) -> Vec<u8> {
-    if r.first().is_some_and(|c| c.eq_ignore_ascii_case(&neg)) {
-        perl_nv(-perl_num(deg)).into_bytes()
-    } else {
-        deg.to_vec()
-    }
-}
-
-/// ExifTool's Composite GPSAltitude ValueConv on the GPS texts: only for a float text
-/// (`IsFloat`); a true ref (not `''` or `"0"`) gives `-abs(value)`, else the text itself.
-fn composite_altitude(alt: &[u8], r: &[u8]) -> Option<Vec<u8>> {
-    if !is_float(alt) {
-        return None;
-    }
-    Some(if r.is_empty() || r == b"0" {
-        alt.to_vec()
-    } else {
-        perl_nv(-perl_num(alt).abs()).into_bytes()
-    })
-}
-
-/// ExifTool's `IsFloat`: `^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee][+-]\d+)?$`.
-fn is_float(s: &[u8]) -> bool {
-    let s = s.strip_suffix(b"\n").unwrap_or(s);
-    let s = s
-        .strip_prefix(b"+")
-        .or_else(|| s.strip_prefix(b"-"))
-        .unwrap_or(s);
-    let digits = |i: usize| {
-        s.get(i..)
-            .map_or(0, |t| t.iter().take_while(|c| c.is_ascii_digit()).count())
-    };
-    let int = digits(0);
-    let mut i = int;
-    let mut frac = 0;
-    if s.get(i) == Some(&b'.') {
-        frac = digits(i + 1);
-        i += 1 + frac;
-    }
-    if int == 0 && frac == 0 {
-        return false;
-    }
-    if matches!(s.get(i), Some(b'e' | b'E')) && matches!(s.get(i + 1), Some(b'+' | b'-')) {
-        let exp = digits(i + 2);
-        if exp == 0 {
-            return false;
-        }
-        i += 2 + exp;
-    }
-    i == s.len()
-}
-
-/// The values of one XMP property, in document order.
-fn xmp_values<'a>(xmp: &'a Xmp, ns: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> {
-    xmp.properties()
-        .iter()
-        .filter(move |p| p.ns == ns && p.name == name)
-        .map(|p| p.value.as_str())
-}
-
 fn xmp_fields<'a>(xmp: &'a Xmp, f: &mut Vec<(String, Val<'a>)>) {
-    // XMP-tiff has priority 0 and xmp:CreateDate priority 0: the first one stays.
-    let orientation = xmp_values(xmp, NS_TIFF, "Orientation").next();
-    put(f, "XMP-tiff:Orientation", orientation.map(|v| v.into()));
-    let create = xmp_values(xmp, NS_XMP, "CreateDate").next();
+    // Xmp::get, create_date and rating follow ExifTool's priorities: tiff:Orientation and
+    // xmp:CreateDate the first, xmp:Rating the last.
+    put(
+        f,
+        "XMP-tiff:Orientation",
+        xmp.get(NS_TIFF, "Orientation").map(text),
+    );
     put(
         f,
         "XMP-xmp:CreateDate",
-        create.map(|v| convert_xmp_date(v, false).into_bytes()),
+        xmp.create_date()
+            .map(|v| convert_xmp_date(v, false).into_bytes()),
     );
-    let rating = xmp_values(xmp, NS_XMP, "Rating").last();
-    put(f, "XMP-xmp:Rating", rating.map(|v| v.into()));
+    put(f, "XMP-xmp:Rating", xmp.rating().map(text));
 
     let mut names: Vec<&str> = Vec::new();
     for p in xmp.hdrgm() {
@@ -466,64 +404,6 @@ fn ucfirst(s: &str) -> String {
         Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
         None => String::new(),
     }
-}
-
-/// ExifTool's `ReadValue` text for one entry: numbers joined with a space, ASCII cut at the
-/// first NUL, rationals as `%.10g` (`inf` for x/0, `undef` for 0/0), floats as Perl prints a
-/// number, an UNDEFINED value of one byte as a number, longer UNDEFINED values as their bytes.
-fn read_value(v: &Value) -> Vec<u8> {
-    fn join<T>(xs: &[T], f: impl Fn(&T) -> String) -> Vec<u8> {
-        xs.iter().map(f).collect::<Vec<_>>().join(" ").into_bytes()
-    }
-    match v {
-        Value::Byte(x) => join(x, u8::to_string),
-        Value::Ascii(x) => x.split(|&b| b == 0).next().unwrap_or_default().to_vec(),
-        Value::Short(x) => join(x, u16::to_string),
-        Value::Long(x) => join(x, u32::to_string),
-        Value::Rational(x) => join(x, |r| rational(i64::from(r.num), i64::from(r.den))),
-        Value::SByte(x) => join(x, i8::to_string),
-        Value::Undefined(x) => match x.as_slice() {
-            [b] => b.to_string().into_bytes(),
-            _ => x.clone(),
-        },
-        Value::SShort(x) => join(x, i16::to_string),
-        Value::SLong(x) => join(x, i32::to_string),
-        Value::SRational(x) => join(x, |r| rational(i64::from(r.num), i64::from(r.den))),
-        Value::Float(x) => join(x, |&n| perl_nv(f64::from(n))),
-        Value::Double(x) => join(x, |&n| perl_nv(n)),
-    }
-}
-
-/// The stored bytes of a value, in the block's byte order (ExifTool's `Format => 'undef'`).
-fn stored_bytes(v: &Value, order: ByteOrder) -> Vec<u8> {
-    let big = matches!(order, ByteOrder::Big);
-    let mut out = Vec::new();
-    let mut push = |le: &[u8]| {
-        if big {
-            out.extend(le.iter().rev());
-        } else {
-            out.extend_from_slice(le);
-        }
-    };
-    match v {
-        Value::Byte(x) | Value::Ascii(x) | Value::Undefined(x) => return x.clone(),
-        Value::SByte(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::Short(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::SShort(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::Long(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::SLong(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::Rational(x) => x.iter().for_each(|r| {
-            push(&r.num.to_le_bytes());
-            push(&r.den.to_le_bytes());
-        }),
-        Value::SRational(x) => x.iter().for_each(|r| {
-            push(&r.num.to_le_bytes());
-            push(&r.den.to_le_bytes());
-        }),
-        Value::Float(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-        Value::Double(x) => x.iter().for_each(|n| push(&n.to_le_bytes())),
-    }
-    out
 }
 
 /// A rational as ExifTool reads it. An exact integer quotient is a Perl integer, so 0/x is
@@ -577,27 +457,6 @@ fn perl_nv(x: f64) -> String {
 /// Perl's `\s` on a byte string.
 fn is_perl_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
-}
-
-/// Perl `s/[set]+$//`: removes the first run of `set` bytes that ends at the end of `s` or
-/// right before a final newline (which stays).
-fn perl_strip_end(s: &[u8], set: impl Fn(u8) -> bool) -> Vec<u8> {
-    let mut i = 0;
-    while i < s.len() {
-        let run = s[i..].iter().take_while(|&&b| set(b)).count();
-        if run == 0 {
-            i += 1;
-            continue;
-        }
-        let j = i + run;
-        if j == s.len() || (j + 1 == s.len() && s[j] == b'\n') {
-            let mut out = s[..i].to_vec();
-            out.extend_from_slice(&s[j..]);
-            return out;
-        }
-        i = j;
-    }
-    s.to_vec()
 }
 
 /// Perl numification of a string: the longest number at the start, `Inf`/`NaN`, else 0.

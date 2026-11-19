@@ -148,7 +148,9 @@ fn profile_kind(keyword: &[u8]) -> Option<Profile> {
 }
 
 /// Inflates a zlib stream under the remaining budget and `cap`. `None` when the stream is
-/// unreadable. The output is charged.
+/// unreadable. The output is charged: the decoder grows its buffer up to twice the output, so
+/// the whole capacity is charged, then the buffer is shrunk to the output and the rest given
+/// back.
 fn inflate(
     src: &[u8],
     cap: usize,
@@ -162,8 +164,11 @@ fn inflate(
         max_alloc: max,
     };
     match deflate::zlib::decode_limit(src, usize::MAX, &lim, budget.cancel()) {
-        Ok(v) => {
-            budget.charge(v.len())?;
+        Ok(mut v) => {
+            let held = v.capacity();
+            budget.charge(held)?;
+            v.shrink_to_fit();
+            budget.release(held.saturating_sub(v.capacity()));
             Ok(Some(v))
         }
         Err(deflate::Error::OutputLimit) => Err(Error::LimitExceeded(if cap <= rem {
@@ -493,7 +498,7 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
             if !compressed {
                 // The text runs to the end of the chunk data.
                 let base = c.dend - text.len();
-                if let Some(r) = xmp_span(text, limits) {
+                if let Some(r) = xmp_span(text, limits, budget)? {
                     xmp = Some((c, base + r.start..base + r.end));
                 }
             }
@@ -501,13 +506,15 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
     }
     let mut out = out_vec(budget, data.len())?;
     out.extend_from_slice(data);
-    if let Some(c) = exif {
-        if let Some(block) = out.get_mut(c.dstart..c.dend) {
-            reset_exif_in_place(block);
-        }
+    // A chunk is rewritten (and its CRC recomputed) only when a byte of its data changes.
+    if let Some(c) = exif
+        && out
+            .get_mut(c.dstart..c.dend)
+            .is_some_and(reset_exif_in_place)
+    {
         fix_crc(&mut out, c.start, c.dend);
     }
-    if let Some((c, span)) = xmp {
+    if let Some((c, span)) = xmp.filter(|(_, s)| data.get(s.clone()) != Some(&b"1"[..])) {
         let new_dend = c.dend - span.len() + 1;
         let new_len = u32::try_from(new_dend - c.dstart)
             .ok()

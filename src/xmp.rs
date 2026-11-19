@@ -28,6 +28,11 @@ pub struct Property {
     pub name: String,
     /// The text, with entities and CDATA resolved.
     pub value: String,
+    /// Whether this is a top-level property: an attribute or child element of an
+    /// `rdf:Description` that is not inside another property, or an item of such a property's
+    /// `rdf:Seq`/`rdf:Bag`/`rdf:Alt`. A field of a structure (for example an `xmpMM:Pantry` item
+    /// or `exif:Flash/exif:Fired`) is not: ExifTool gives it a flattened name.
+    pub top_level: bool,
 }
 
 /// A parsed XMP packet.
@@ -83,7 +88,7 @@ impl Xmp {
         // Count first so that the property vector is reserved once, at its final size.
         let mut n = 0usize;
         for data in std::iter::once(packet).chain(extended) {
-            scan(data, limits, budget, &mut |_, _, _| {
+            scan(data, limits, budget, &mut |_, _, _, _| {
                 n += 1;
                 Ok(ControlFlow::Continue(()))
             })?;
@@ -105,55 +110,78 @@ impl Xmp {
         &self.props
     }
 
-    /// The text of the first property with that namespace URI and local name.
-    pub fn get(&self, ns: &str, name: &str) -> Option<&str> {
+    /// The texts of the top-level properties with that namespace URI and local name, in
+    /// document order.
+    fn values<'a>(&'a self, ns: &str, name: &str) -> impl DoubleEndedIterator<Item = &'a str> {
         self.props
             .iter()
-            .find(|p| p.ns == ns && p.name == name)
+            .filter(move |p| p.top_level && p.ns == ns && p.name == name)
             .map(|p| p.value.as_str())
     }
 
-    /// `tiff:Orientation` (`http://ns.adobe.com/tiff/1.0/`) as a number; surrounding whitespace is
-    /// ignored. `None` when absent or not a `u16`. ExifTool prints the integer.
+    /// The text of the first top-level property with that namespace URI and local name
+    /// (structure fields are not looked at).
+    pub fn get(&self, ns: &str, name: &str) -> Option<&str> {
+        self.values(ns, name).next()
+    }
+
+    /// The first top-level `tiff:Orientation` (`http://ns.adobe.com/tiff/1.0/`) as a number
+    /// (ExifTool's priority 0: the first one stays); surrounding whitespace is ignored. `None`
+    /// when absent or not a `u16`. ExifTool prints the integer.
     pub fn orientation(&self) -> Option<u16> {
         self.get(NS_TIFF, "Orientation")?.trim().parse().ok()
     }
 
-    /// `xmp:CreateDate` (`http://ns.adobe.com/xap/1.0/`), the raw text as stored (for example
-    /// `2020-01-02T03:04:05Z`; ExifTool rewrites the date to `2020:01:02 03:04:05Z`).
+    /// The first top-level `xmp:CreateDate` (`http://ns.adobe.com/xap/1.0/`; priority 0, as
+    /// ExifTool), the raw text as stored (for example `2020-01-02T03:04:05Z`; ExifTool rewrites
+    /// the date to `2020:01:02 03:04:05Z`).
     pub fn create_date(&self) -> Option<&str> {
         self.get(NS_XMP, "CreateDate")
     }
 
-    /// `xmp:Rating`, the raw text as stored (ExifTool prints it as a number).
+    /// The last top-level `xmp:Rating` (ExifTool keeps the last one), the raw text as stored
+    /// (ExifTool prints it as a number).
     pub fn rating(&self) -> Option<&str> {
-        self.get(NS_XMP, "Rating")
+        self.values(NS_XMP, "Rating").next_back()
     }
 
-    /// The properties of the HDR gain map namespace `http://ns.adobe.com/hdr-gain-map/1.0/`
-    /// (`hdrgm:Version`, `hdrgm:GainMapMax`, ...), raw text.
+    /// The top-level properties of the HDR gain map namespace
+    /// `http://ns.adobe.com/hdr-gain-map/1.0/` (`hdrgm:Version`, `hdrgm:GainMapMax`, ...), raw
+    /// text.
     pub fn hdrgm(&self) -> impl Iterator<Item = &Property> {
-        self.props.iter().filter(|p| p.ns == NS_HDRGM)
+        self.props
+            .iter()
+            .filter(|p| p.top_level && p.ns == NS_HDRGM)
     }
 }
 
-/// The byte range in `packet` of the raw text of the first `tiff:Orientation` value (the
-/// attribute value without quotes, or the element text). `None` when absent or when a limit
-/// stops the scan.
-pub(crate) fn orientation_value_span(packet: &[u8], limits: &Limits) -> Option<Range<usize>> {
-    let cancel = AtomicBool::new(false);
-    let budget = Budget::new(limits, &cancel);
+/// The byte range in `packet` of the raw text of the first top-level `tiff:Orientation` value
+/// (the attribute value without quotes, or the element text); `None` when absent. The scan is
+/// charged to `budget` and checks its cancel flag.
+///
+/// # Errors
+///
+/// As [`Xmp::parse`]: `LimitExceeded` for `max_xmp_bytes`, `max_xmp_nodes` and `max_alloc`,
+/// `OutOfMemory`, `Cancelled`.
+pub(crate) fn orientation_value_span(
+    packet: &[u8],
+    limits: &Limits,
+    budget: &Budget<'_>,
+) -> Result<Option<Range<usize>>, Error> {
+    if packet.len() > limits.max_xmp_bytes {
+        return Err(Error::LimitExceeded(Limit::XmpBytes));
+    }
+    budget.check_cancel()?;
     let mut found = None;
-    scan(packet, limits, &budget, &mut |ns, name, span| {
-        if ns == NS_TIFF.as_bytes() && name == b"Orientation" {
+    scan(packet, limits, budget, &mut |ns, name, span, top| {
+        if top && ns == NS_TIFF.as_bytes() && name == b"Orientation" {
             found = Some(span);
             Ok(ControlFlow::Break(()))
         } else {
             Ok(ControlFlow::Continue(()))
         }
-    })
-    .ok()?;
-    found
+    })?;
+    Ok(found)
 }
 
 fn collect(
@@ -162,7 +190,7 @@ fn collect(
     budget: &Budget<'_>,
     out: &mut Vec<Property>,
 ) -> Result<(), Error> {
-    scan(data, limits, budget, &mut |ns, name, span| {
+    scan(data, limits, budget, &mut |ns, name, span, top_level| {
         let raw = data.get(span).unwrap_or_default();
         if let (Ok(ns), Ok(name)) = (std::str::from_utf8(ns), std::str::from_utf8(name)) {
             let mut bytes = budget.vec::<u8>(raw.len())?;
@@ -172,6 +200,7 @@ fn collect(
                     ns: charged_str(ns, budget)?,
                     name: charged_str(name, budget)?,
                     value,
+                    top_level,
                 }),
                 // The decode buffer was charged at the raw length.
                 Err(_) => budget.release(raw.len()),
@@ -368,13 +397,32 @@ struct Frame {
     text_start: usize,
     /// Namespace URI and local name of the property this element (or its list) stands for.
     prop: Option<NameRanges>,
+    /// Inside a property element, array or list item (a description here holds struct fields).
+    nested: bool,
+    /// A top-level description, a property of one, or that property's array or list item.
+    top: bool,
 }
 
-// Twice the size: a push may grow the vector's capacity.
-const FRAME_COST: usize = 2 * size_of::<Frame>();
-const NS_COST: usize = 2 * size_of::<NameRanges>();
+/// Makes room for one more item in `v`. The capacity a growth adds is charged and stays charged
+/// until the scan ends (a `Vec` keeps its capacity when items are removed).
+fn reserve_one<T>(v: &mut Vec<T>, budget: &Budget<'_>, charged: &mut usize) -> Result<(), Error> {
+    if v.len() < v.capacity() {
+        return Ok(());
+    }
+    let add = v.capacity().max(4);
+    let bytes = add
+        .checked_mul(size_of::<T>())
+        .ok_or(Error::LimitExceeded(Limit::Alloc))?;
+    budget.charge(bytes)?;
+    if v.try_reserve_exact(add).is_err() {
+        budget.release(bytes);
+        return Err(Error::OutOfMemory);
+    }
+    *charged = charged.saturating_add(bytes);
+    Ok(())
+}
 
-/// The element and namespace stacks; their memory is charged to the budget.
+/// The element and namespace stacks; their capacity is charged to the budget.
 struct Stacks {
     frames: Vec<Frame>,
     /// (prefix range, URI range) per `xmlns` declaration in scope.
@@ -389,31 +437,23 @@ impl Stacks {
         prefix: Range<usize>,
         uri: Range<usize>,
     ) -> Result<(), Error> {
-        budget.charge(NS_COST)?;
-        self.charged += NS_COST;
+        reserve_one(&mut self.nss, budget, &mut self.charged)?;
         self.nss.push((prefix, uri));
         Ok(())
     }
 
     fn push_frame(&mut self, budget: &Budget<'_>, f: Frame) -> Result<(), Error> {
-        budget.charge(FRAME_COST)?;
-        self.charged += FRAME_COST;
+        reserve_one(&mut self.frames, budget, &mut self.charged)?;
         self.frames.push(f);
         Ok(())
     }
 
-    fn pop_frame(&mut self, budget: &Budget<'_>) -> Option<Frame> {
-        let f = self.frames.pop()?;
-        budget.release(FRAME_COST);
-        self.charged = self.charged.saturating_sub(FRAME_COST);
-        Some(f)
+    fn pop_frame(&mut self) -> Option<Frame> {
+        self.frames.pop()
     }
 
-    fn truncate_ns(&mut self, budget: &Budget<'_>, mark: usize) {
-        let removed = self.nss.len().saturating_sub(mark) * NS_COST;
+    fn truncate_ns(&mut self, mark: usize) {
         self.nss.truncate(mark);
-        budget.release(removed);
-        self.charged = self.charged.saturating_sub(removed);
     }
 
     fn resolve(&self, data: &[u8], prefix: &[u8]) -> Option<Range<usize>> {
@@ -425,10 +465,11 @@ impl Stacks {
     }
 }
 
-type Sink<'a> = &'a mut dyn FnMut(&[u8], &[u8], Range<usize>) -> Result<ControlFlow<()>, Error>;
+type Sink<'a> =
+    &'a mut dyn FnMut(&[u8], &[u8], Range<usize>, bool) -> Result<ControlFlow<()>, Error>;
 
-/// Walks the XML and calls `f(namespace URI, local name, raw value range)` for each simple
-/// property; `Break` from `f` stops the scan.
+/// Walks the XML and calls `f(namespace URI, local name, raw value range, top-level)` for each
+/// simple property; `Break` from `f` stops the scan.
 fn scan(data: &[u8], limits: &Limits, budget: &Budget<'_>, f: Sink<'_>) -> Result<(), Error> {
     let mut st = Stacks {
         frames: Vec::new(),
@@ -500,19 +541,19 @@ fn scan_inner(
                 .map(|(i, _)| i);
             let Some(idx) = idx else { continue };
             while st.frames.len() > idx + 1 {
-                st.pop_frame(budget);
+                st.pop_frame();
             }
-            let Some(fr) = st.pop_frame(budget) else {
+            let Some(fr) = st.pop_frame() else {
                 continue;
             };
-            st.truncate_ns(budget, fr.ns_mark);
+            st.truncate_ns(fr.ns_mark);
             if matches!(fr.role, Role::Prop | Role::Li)
                 && !fr.has_child
                 && let Some((u, l)) = &fr.prop
             {
                 let ub = data.get(u.clone()).unwrap_or_default();
                 let lb = data.get(l.clone()).unwrap_or_default();
-                if f(ub, lb, fr.text_start..lt)?.is_break() {
+                if f(ub, lb, fr.text_start..lt, fr.top)?.is_break() {
                     return Ok(());
                 }
             }
@@ -578,10 +619,12 @@ fn scan_inner(
         let uri = st.resolve(data, prefix);
         let uri_b = uri.as_ref().and_then(|u| data.get(u.clone()));
         let local = data.get(local_r.clone()).unwrap_or_default();
-        let (parent_role, parent_prop) = st
-            .frames
-            .last()
-            .map_or((None, None), |p| (Some(p.role), p.prop.clone()));
+        let (parent_role, parent_prop, parent_nested, parent_top) =
+            st.frames.last().map_or((None, None, false, false), |p| {
+                (Some(p.role), p.prop.clone(), p.nested, p.top)
+            });
+        let nested =
+            parent_nested || matches!(parent_role, Some(Role::Prop | Role::Container | Role::Li));
         let (role, prop) = if uri_b == Some(NS_RDF) {
             match local {
                 b"Description" => (Role::Desc, None),
@@ -595,6 +638,12 @@ fn scan_inner(
             (Role::Prop, uri.map(|u| (u, local_r)))
         } else {
             (Role::Other, None)
+        };
+        let top = match role {
+            Role::Desc => !nested,
+            Role::Prop => parent_role == Some(Role::Desc) && parent_top,
+            Role::Container | Role::Li => parent_top,
+            Role::Other => false,
         };
 
         if role == Role::Desc {
@@ -611,14 +660,14 @@ fn scan_inner(
                     continue;
                 };
                 let ub = data.get(u).unwrap_or_default();
-                if ub != NS_RDF && f(ub, at(aname, c + 1), av)?.is_break() {
+                if ub != NS_RDF && f(ub, at(aname, c + 1), av, top)?.is_break() {
                     return Ok(());
                 }
             }
         }
 
         if self_closing {
-            st.truncate_ns(budget, mark);
+            st.truncate_ns(mark);
         } else {
             st.push_frame(
                 budget,
@@ -629,6 +678,8 @@ fn scan_inner(
                     has_child: false,
                     text_start: pos,
                     prop,
+                    nested,
+                    top,
                 },
             )?;
         }

@@ -44,6 +44,16 @@ impl<'a> Budget<'a> {
         self.used.set(self.used.get().saturating_sub(n));
     }
 
+    /// The bytes charged now, a mark for [`reset_to`](Self::reset_to).
+    pub(crate) fn used(&self) -> usize {
+        self.used.get()
+    }
+
+    /// Gives back everything charged since `mark` (the buffers charged since then were dropped).
+    pub(crate) fn reset_to(&self, mark: usize) {
+        self.used.set(self.used.get().min(mark));
+    }
+
     /// An empty `Vec` with room for `n` items, charged first.
     pub(crate) fn vec<T>(&self, n: usize) -> Result<Vec<T>, Error> {
         let bytes = n

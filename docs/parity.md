@@ -1,8 +1,10 @@
 # Parity with ExifTool
 
 exif-rs is a new crate with no Go original. Its oracle is ExifTool 13.64, which runs only in CI.
-Every field exif-rs exposes is compared as exact text with what `exiftool -j -n -G1 -a -b` prints,
-and every strip mode is checked with ExifTool and with a pixel decode.
+The compared keys (table below) are emitted from the public accessors that expose them, and
+compared as exact text with what `exiftool -j -n -G1 -a -b` prints; the oracle only formats the
+accessor's value as ExifTool prints it, and an accessor that gives `None` gives no key. Every
+strip mode is checked with ExifTool and with a pixel decode.
 
 Counts: see the latest parity run summary
 
@@ -13,6 +15,8 @@ Pillow, otherwise it exits 2):
 
 1. `tests/parity/inputs.sh <corpus> /work/in` makes a flat dir of symlinks to the inputs (see
    Corpus). ExifTool and the oracle both follow symlinks. `PARITY_EVERY_N=<n>` keeps every n-th.
+   The run fails when inputs.sh fails, when either source gives no input, or when there are
+   fewer than `PARITY_MIN_INPUTS` (default 2402, the corpus at the pinned commits) divided by n.
 2. `perl <corpus>/exiftool/exiftool -j -n -G1 -a -b -ext '*' /work/in` gives `exiftool.json`.
    `-n` turns off print conversion (the value after ValueConv), `-G1` puts the family-1 group in
    each key (`IFD0:Make`), `-a` keeps duplicates, `-b` prints binary values (base64). `-ext '*'`
@@ -52,27 +56,34 @@ No personal photos are used. A link is named `<source>__<path with / and spaces 
 `compare.py` loads ExifTool's JSON with numbers kept as their exact text (`parse_float`/`parse_int`
 give a `str` subclass), so `1.50` and `1.5` differ, and a number never equals a string. For each
 input and each compared key: in both sides with the same type and text is a match; in one side
-only, or different, is a mismatch. An input that ExifTool does not read as JPEG, PNG or WEBP
-(`File:FileType`) and that exif-rs refuses with `unknown-format` is skipped and counted. A
+only, or different, is a mismatch. An input without JPEG, PNG or WebP magic bytes that exif-rs
+refuses with `unknown-format` is skipped and counted. Any other exif-rs error, or a file the
+oracle has no record of, is a mismatch of the key `Error`, whatever keys ExifTool has. A
 mismatch listed in `tests/parity/known-differences.tsv` (`file<TAB>key<TAB>reason`) is counted
 as known; any other mismatch fails the run.
 
-Compared keys and where the oracle takes them from:
+Compared keys and the accessor each comes from:
 
 | Key | exif-rs | ExifTool -n value |
 |---|---|---|
-| IFD0:Orientation, IFD0:Make, IFD0:Model | `Exif::entries(Ifd0)` | ReadValue; Make and Model RawConv trims trailing `\s` |
-| ExifIFD:DateTimeOriginal, SubSecTimeOriginal, OffsetTimeOriginal, ExposureTime, FNumber, ISO, FocalLength, ExifImageWidth, ExifImageHeight, LensMake, LensModel | `entries(Exif)` | ReadValue; SubSecTimeOriginal ValueConv trims trailing spaces |
-| GPS:GPSLatitudeRef, GPSLongitudeRef, GPSAltitudeRef, GPSAltitude | `entries(Gps)` | ReadValue |
-| GPS:GPSLatitude, GPS:GPSLongitude | `entries(Gps)` | `ToDegrees` |
-| GPS:GPSTimeStamp | `entries(Gps)` | `ConvertTimeStamp` |
-| GPS:GPSDateStamp | `entries(Gps)` | read as `undef`, trailing NULs removed, `ExifDate` |
+| IFD0:Orientation | `Exif::orientation` | ReadValue |
+| IFD0:Make, IFD0:Model | `Exif::make`, `model` | ReadValue; RawConv trims trailing `\s` |
+| ExifIFD:DateTimeOriginal, SubSecTimeOriginal, OffsetTimeOriginal | `Exif::capture_time` | ReadValue; SubSecTimeOriginal ValueConv trims trailing spaces |
+| ExifIFD:ExposureTime, FNumber, ISO, FocalLength | `Exif::exposure` | ReadValue |
+| ExifIFD:ExifImageWidth, ExifImageHeight | `Exif::pixel_size` | ReadValue |
+| ExifIFD:LensMake, LensModel | `Exif::lens_make`, `lens_model` | ReadValue |
+| GPS:GPSLatitudeRef, GPSLongitudeRef, GPSAltitudeRef, GPSAltitude | `Exif::gps` fields | ReadValue |
+| GPS:GPSLatitude, GPS:GPSLongitude | `Gps::latitude`, `longitude` | `ToDegrees` |
+| GPS:GPSTimeStamp | `Gps::time_stamp` | `ConvertTimeStamp` |
+| GPS:GPSDateStamp | `Gps::date_stamp` | `ExifDate` |
 | Composite:GPSLatitude, Composite:GPSLongitude | `Gps::latitude_deg`, `longitude_deg` | ToDegrees, negated for `S`/`W` |
 | Composite:GPSAltitude | `Gps::altitude_m` | the GPSAltitude text, or `-abs` of it when the ref is not 0 |
-| Composite:GPSDateTime | the GPS keys above | `"<date> <time>Z"` |
+| Composite:GPSDateTime | `Gps::date_stamp`, `time_stamp` | `"<date> <time>Z"` |
 | Composite:SubSecDateTimeOriginal | `Exif::capture_time` | sub-seconds and offset added (RawConv) |
 | IFD1:ThumbnailImage | `Exif::thumbnail` | the bytes (binary) |
-| XMP-tiff:Orientation, XMP-xmp:CreateDate, XMP-xmp:Rating | `Xmp::properties` | the text; CreateDate `ConvertXMPDate` |
+| XMP-tiff:Orientation | `Xmp::get` | the text |
+| XMP-xmp:CreateDate | `Xmp::create_date` | `ConvertXMPDate` |
+| XMP-xmp:Rating | `Xmp::rating` | the text |
 | XMP-hdrgm:* | `Xmp::hdrgm` | the text; unknown names XMPAutoConv |
 | EXIF:EXIF, XMP:XMP, ICC_Profile:ICC_Profile | `Metadata::raw` | the blocks (binary) |
 
@@ -97,18 +108,14 @@ Value conversion (ExifTool.pm `ReadValue`, Exif.pm, GPS.pm, XMP.pm):
   numification), then `h = int(f/3600)`, `m = int(f/60)` of the rest, seconds as `%012.9f`;
   `>= 60` gives `00` and a carry into minutes and hours, else trailing zeros and a bare `.` are
   removed; `%.2d:%.2d:<s>`. A part that is not a finite number is not reproduced (no key).
-- GPSDateStamp has `Format => 'undef'`: the stored bytes whatever the type, `s/\0+$//`, then
-  `Exif::ExifDate`: `s/(\d{4})[^\d]*(\d{2})[^\d]*(\d{2})$/$1:$2:$3/`.
+- GPSDateStamp has `Format => 'undef'` (the stored bytes whatever the type, `s/\0+$//`); the
+  oracle takes `Gps::date_stamp` (ASCII up to the first NUL), then `Exif::ExifDate`:
+  `s/(\d{4})[^\d]*(\d{2})[^\d]*(\d{2})$/$1:$2:$3/`.
 - Composite:GPSLatitude/GPSLongitude (`Require` GPS:GPSLatitude and its ref): `Gps::latitude_deg`
-  as a Perl number when it has a value; else (a coordinate that is not RATIONAL, or has an
-  `inf`/`undef` part) ExifTool's ValueConv on the texts, `$ref =~ /^S/i ? -$deg : $deg` (`W` for
-  longitude), where `$deg` is the GPS:GPSLatitude text: `''` from ToDegrees stays `''` (printed
-  as a string), and Perl's `-''` and `-"0"` are `0`.
-- Composite:GPSAltitude (`Desire` the altitude and its ref, needs the ref): `Gps::altitude_m`
-  when it has a value, with ref 0 the GPS:GPSAltitude text (`%.10g`), else `-abs(value)` printed
-  as a Perl number; else ExifTool's ValueConv on the texts: only when the altitude text is
-  `IsFloat` (`^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee][+-]\d+)?$`), a true ref (not `''` or `0`) gives
-  `-abs`, else the text. The XMP GPSAltitude fallback of the same Composite is not reproduced.
+  as a Perl number; no key when it is `None`.
+- Composite:GPSAltitude (`Desire` the altitude and its ref, needs the ref): `Gps::altitude_m`,
+  with ref 0 the GPS:GPSAltitude text (`%.10g`), else `-abs(value)` printed as a Perl number; no
+  key when it is `None`. The XMP GPSAltitude fallback of the same Composite is not reproduced.
   Composite:GPSDateTime is `"$date $time" . "Z"` of the two converted GPS keys.
 - Composite:SubSecDateTimeOriginal (raw values): when SubSecTimeOriginal starts with digits,
   `.<digits>` goes after the first ` hh:mm:ss` not already followed by `.digit` (no such time: no
@@ -163,17 +170,35 @@ JSON writing (the `exiftool` script, `EscapeJSON` and `ConvertBinary`):
 These follow the exif-rs API on purpose; a mismatch they cause goes in `known-differences.tsv`
 with the reason:
 
-- `Gps::latitude_deg`/`longitude_deg` need RATIONAL[3] and finite parts, `Gps::altitude_m` a
-  RATIONAL; ExifTool reads any type and prints `''` or `0` for `inf`/`undef`. The oracle then
-  uses ExifTool's rule on the texts (above), so those files do not test these accessors.
+- The typed accessors read typed values: `Gps::latitude`/`longitude`/`time_stamp` and
+  `latitude_deg`/`longitude_deg` need RATIONAL[3] (and finite parts for the degrees),
+  `altitude`/`altitude_m` and the exposure values a RATIONAL, `iso` and `pixel_size` a SHORT or
+  LONG (`iso` the first value: ExifTool prints `100 200` for two), the strings ASCII (or EXIF 3.0
+  UTF-8) that is valid UTF-8, the GPS refs their first byte (`altitude_ref` as a number: an ASCII
+  `"0"` is 48), `orientation` the first value of an integer type. ExifTool reads any type, so
+  such a value is a mismatch (no key on the exif-rs side).
+- `CaptureTime` needs DateTimeOriginal: without it there is no SubSecTimeOriginal or
+  OffsetTimeOriginal key either.
 - `Exif::capture_time` reads the Exif IFD only; ExifTool's Composite also takes an IFD0
   DateTimeOriginal.
 - exif-rs reads the first EXIF block and XMP packet of a file; ExifTool reads all of them.
+- The JPEG APP1 EXIF and XMP headers must be exact (`Exif\0\0`, the XMP namespace); ExifTool
+  also takes up to 4 bytes before `Exif\0`, any byte after it, any case, and an `XMP\0` header.
+- WebP chunks after the end the RIFF size gives are not read (nor reset); ExifTool reads to the
+  end of the file.
+- A PNG raw profile whose hex holds fewer digits than its length says is not read, and one with
+  more is cut at the length; ExifTool decodes all of the hex and warns.
 
 ## Strip checks
 
 `strip_check.py` reads ExifTool's JSON of each output and of its original. Every output of a mode
-is checked; the files exif-rs refused are counted by error class (`<mode>.errors`).
+is checked; the files exif-rs refused are counted by error class (`<mode>.errors`). A refusal
+fails the run unless it is a file without JPEG/PNG/WebP magic refused as `unknown-format`, or
+(modes all and keep only) a file that `tests/parity/strip-refusals.tsv` lists with that class:
+the truncated and malformed JPEG/PNG/WebP files strip refuses on purpose. In modes all and keep,
+when ExifTool reads the original without `ExifTool:Error`, the output must have no
+`ExifTool:Error` and the same `File:MIMEType` (`File:FileType` may change: a WebP file that gets
+a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway.
 
 - **all** (`strip(Keep::default())`): only these keys may remain: groups `ExifTool`, `System`,
   `JFIF`, `Adobe` (APP14), `PNG-pHYs`, `PNG-cICP`; `File` except `File:Comment` and
@@ -210,8 +235,8 @@ failure.
   JPEG/PNG/WEBP, ExifTool file types, exif-rs error classes, skipped inputs, and per key the
   number of files compared, matched, mismatched and known. A key with 0 compared is not in the
   corpus.
-- Strip checks: per mode the outputs, exif-rs errors, files with tag failures, pixel checks done,
-  identical, failed and skipped (with reasons).
+- Strip checks: per mode the outputs, exif-rs errors, unexpected refusals, files with tag
+  failures, pixel checks done, identical, failed and skipped (with reasons).
 
 Lists: `read-mismatches.tsv` (file, key, ExifTool value, oracle value, as type and text),
 `strip-failures.tsv` (mode, file, tags or pixels, detail), `strip-<mode>.errors`, and

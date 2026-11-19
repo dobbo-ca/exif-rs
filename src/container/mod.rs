@@ -26,11 +26,13 @@ pub enum Container {
 pub struct Raw {
     /// The container the blocks came from.
     pub container: Container,
-    /// The EXIF block, starting at the TIFF header (`Exif\0\0` removed).
+    /// The EXIF block, starting at the TIFF header (`Exif\0\0` removed; in a JPEG the APP1
+    /// segments that continue it, as ExifTool reads multi-segment EXIF, are appended).
     pub exif: Option<Vec<u8>>,
     /// The standard XMP packet, as stored.
     pub xmp: Option<Vec<u8>>,
-    /// JPEG extended XMP, the chunks put together by offset; `None` in other containers.
+    /// JPEG extended XMP, the chunks put together by offset (only when they cover the full
+    /// length, as ExifTool requires); `None` in other containers.
     pub xmp_extended: Option<Vec<u8>>,
     /// The ICC profile (JPEG APP2 chunks joined, PNG iCCP inflated, WebP ICCP).
     pub icc: Option<Vec<u8>>,
@@ -179,10 +181,15 @@ pub(crate) fn out_vec(budget: &Budget, input_len: usize) -> Result<Vec<u8>, Erro
 }
 
 /// The byte range of the `tiff:Orientation` value in `packet`, when it is valid for `packet`.
-pub(crate) fn xmp_span(packet: &[u8], limits: &Limits) -> Option<Range<usize>> {
-    let r = crate::xmp::orientation_value_span(packet, limits)?;
-    packet.get(r.clone())?;
-    Some(r)
+/// The scan is charged to the call's budget and checks its cancel flag; the XMP limits are
+/// errors, as in [`read`](crate::read).
+pub(crate) fn xmp_span(
+    packet: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+) -> Result<Option<Range<usize>>, Error> {
+    let r = crate::xmp::orientation_value_span(packet, limits, budget)?;
+    Ok(r.filter(|r| packet.get(r.clone()).is_some()))
 }
 
 /// Replaces the bytes at `span` of `out` by `1`. `out` has room for one more byte.

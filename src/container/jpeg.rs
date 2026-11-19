@@ -200,14 +200,43 @@ fn find_guid(p: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
-fn sum_icc(lens: &[Option<usize>; 256], count: u8) -> Option<usize> {
-    lens.get(1..=usize::from(count))?
-        .iter()
-        .try_fold(0usize, |t, l| t.checked_add((*l)?))
+/// The rest of an APP1 payload that continues the EXIF block of the segment before it:
+/// `Exif\0\0` with no TIFF header after it (ExifTool's multi-segment EXIF).
+fn exif_continuation(p: &[u8]) -> Option<&[u8]> {
+    let b = p.strip_prefix(EXIF_PREFIX)?;
+    (!(b.starts_with(b"II*\0") || b.starts_with(b"MM\0*"))).then_some(b)
+}
+
+/// Appends a continuation to the EXIF block, charging the capacity it adds.
+fn append_exif(
+    v: &mut Vec<u8>,
+    more: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+) -> Result<(), Error> {
+    let need = v
+        .len()
+        .checked_add(more.len())
+        .filter(|&n| n <= limits.max_exif_bytes)
+        .ok_or(Error::LimitExceeded(Limit::ExifBytes))?;
+    if need > v.capacity() {
+        let target = need
+            .max(v.capacity().saturating_mul(2))
+            .min(limits.max_exif_bytes);
+        let add = target - v.capacity();
+        budget.charge(add)?;
+        if v.try_reserve_exact(target - v.len()).is_err() {
+            budget.release(add);
+            return Err(Error::OutOfMemory);
+        }
+    }
+    v.extend_from_slice(more);
+    Ok(())
 }
 
 /// The offset in `data` of the TIFF header of the EXIF block that [`extract`] takes (the first
-/// APP1 `Exif\0\0`).
+/// APP1 `Exif\0\0`). `None` when there is none, or when the block continues in the next
+/// segment: past the first segment, file offsets no longer match block offsets.
 pub(crate) fn exif_start(
     data: &[u8],
     limits: &Limits,
@@ -216,7 +245,11 @@ pub(crate) fn exif_start(
     let mut segs = Segments::new(data, limits, budget);
     while let Item::Seg(s) = segs.step()? {
         if s.marker == 0xE1 && s.payload(data).starts_with(EXIF_PREFIX) {
-            return Ok(Some(s.pstart + EXIF_PREFIX.len()));
+            let continued = matches!(
+                segs.step()?,
+                Item::Seg(n) if n.marker == 0xE1 && exif_continuation(n.payload(data)).is_some()
+            );
+            return Ok((!continued).then_some(s.pstart + EXIF_PREFIX.len()));
         }
     }
     Ok(None)
@@ -235,11 +268,20 @@ pub(crate) fn extract(
         xmp_extended: None,
         icc: None,
     };
-    let mut icc_count = 0u8;
-    let mut icc_len = [None::<usize>; 256];
+    // ICC chunks as ExifTool collects them: the chunk total of the first chunk, then each chunk
+    // under its number (0-255; a repeated number is appended) until as many chunks as the total
+    // were seen (a total of 0: the first chunk). A chunk with another total ends it: no profile.
+    let mut icc_total: Option<u8> = None;
+    let mut icc_seen = 0usize;
+    let mut icc_done: Option<usize> = None;
+    let mut icc_dead = false;
+    let mut icc_len = [0usize; 256];
+    // The segment before was the EXIF block or a continuation of it.
+    let mut exif_open = false;
     let mut segs = Segments::new(data, limits, budget);
     while let Item::Seg(s) = segs.step()? {
         let p = s.payload(data);
+        let was_open = std::mem::replace(&mut exif_open, false);
         match s.marker {
             0xE1 => {
                 if let Some(b) = p.strip_prefix(EXIF_PREFIX) {
@@ -250,6 +292,13 @@ pub(crate) fn extract(
                             limits.max_exif_bytes,
                             Limit::ExifBytes,
                         )?);
+                        exif_open = true;
+                    } else if was_open
+                        && let Some(more) = exif_continuation(p)
+                        && let Some(v) = raw.exif.as_mut()
+                    {
+                        append_exif(v, more, limits, budget)?;
+                        exif_open = true;
                     }
                 } else if let Some(b) = p.strip_prefix(XMP_SIG)
                     && want.xmp
@@ -263,20 +312,19 @@ pub(crate) fn extract(
                     )?);
                 }
             }
-            0xE2 if want.icc => {
-                if let Some([seq, count, rest @ ..]) = p.strip_prefix(ICC_SIG) {
-                    if *seq == 0 || seq > count {
+            0xE2 if want.icc && icc_done.is_none() && !icc_dead => {
+                if let Some([num, tot, rest @ ..]) = p.strip_prefix(ICC_SIG) {
+                    let total = *icc_total.get_or_insert(*tot);
+                    if *tot != total {
+                        icc_dead = true;
                         continue;
                     }
-                    if icc_count == 0 {
-                        icc_count = *count;
-                    } else if icc_count != *count {
-                        continue;
+                    if let Some(l) = icc_len.get_mut(usize::from(*num)) {
+                        *l = l.saturating_add(rest.len());
                     }
-                    if let Some(slot) = icc_len.get_mut(usize::from(*seq))
-                        && slot.is_none()
-                    {
-                        *slot = Some(rest.len());
+                    icc_seen += 1;
+                    if icc_seen >= usize::from(total) {
+                        icc_done = Some(icc_seen);
                     }
                 }
             }
@@ -284,86 +332,145 @@ pub(crate) fn extract(
         }
     }
 
-    let icc_total = if icc_count > 0 {
-        sum_icc(&icc_len, icc_count).filter(|&t| t > 0)
-    } else {
-        None
-    };
+    let icc_bytes = icc_len.iter().fold(0usize, |t, &l| t.saturating_add(l));
+    if let Some(n) = icc_done
+        && icc_bytes > 0
+    {
+        raw.icc = Some(icc_profile(data, limits, budget, &icc_len, n, icc_bytes)?);
+    }
     let guid = if want.xmp {
         raw.xmp.as_deref().and_then(find_guid)
     } else {
         None
     };
-    let mut icc = match icc_total {
-        Some(t) => Some(zeroed(budget, t)?),
-        None => None,
-    };
-    let mut ext: Option<Vec<u8>> = None;
-    if guid.is_some() || icc.is_some() {
+    if let Some(g) = guid {
         let std_len = raw.xmp.as_ref().map_or(0, Vec::len);
-        let mut seen = [false; 256];
-        let mut segs = Segments::new(data, limits, budget);
-        while let Item::Seg(s) = segs.step()? {
-            let p = s.payload(data);
-            match s.marker {
-                0xE1 => {
-                    let Some(g) = guid.as_ref() else { continue };
-                    let Some(c) = p.strip_prefix(EXT_SIG).and_then(ext_chunk) else {
-                        continue;
-                    };
-                    if !c.guid.eq_ignore_ascii_case(g)
-                        || c.full == 0
-                        || !c.off.checked_add(c.data.len()).is_some_and(|e| e <= c.full)
-                    {
-                        continue;
-                    }
-                    if ext.is_none() {
-                        if c.full
-                            .checked_add(std_len)
-                            .is_none_or(|t| t > limits.max_xmp_bytes)
-                        {
-                            return Err(Error::LimitExceeded(Limit::XmpBytes));
-                        }
-                        ext = Some(zeroed(budget, c.full)?);
-                    }
-                    if let Some(buf) = ext.as_mut()
-                        && buf.len() == c.full
-                        && let Some(dst) = buf.get_mut(c.off..c.off + c.data.len())
-                    {
-                        dst.copy_from_slice(c.data);
-                    }
-                }
-                0xE2 => {
-                    let Some(buf) = icc.as_mut() else { continue };
-                    let Some([seq, count, rest @ ..]) = p.strip_prefix(ICC_SIG) else {
-                        continue;
-                    };
-                    let i = usize::from(*seq);
-                    if i == 0 || *count != icc_count || seq > count {
-                        continue;
-                    }
-                    if let Some(done) = seen.get_mut(i) {
-                        if *done {
-                            continue;
-                        }
-                        *done = true;
-                    }
-                    let off = icc_len
-                        .get(1..i)
-                        .map_or(0, |l| l.iter().flatten().sum::<usize>());
-                    if let Some(dst) = buf.get_mut(off..off.saturating_add(rest.len())) {
-                        dst.copy_from_slice(rest);
-                    }
-                }
-                _ => {}
-            }
-        }
+        raw.xmp_extended = extended_xmp(data, limits, budget, &g, std_len)?;
     }
-    raw.icc = icc;
-    raw.xmp_extended = ext;
     Ok(raw)
 }
 
+/// The profile of the first `n` ICC chunks, joined in chunk-number order (the chunks of a
+/// repeated number in file order); `lens` holds the bytes per number, `total` their sum.
+fn icc_profile(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+    lens: &[usize; 256],
+    n: usize,
+    total: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut buf = zeroed(budget, total)?;
+    let mut at = [0usize; 256];
+    let mut sum = 0usize;
+    for (a, &l) in at.iter_mut().zip(lens) {
+        *a = sum;
+        sum = sum.saturating_add(l);
+    }
+    let mut left = n;
+    let mut segs = Segments::new(data, limits, budget);
+    while left > 0
+        && let Item::Seg(s) = segs.step()?
+    {
+        if s.marker != 0xE2 {
+            continue;
+        }
+        let Some([num, _, rest @ ..]) = s.payload(data).strip_prefix(ICC_SIG) else {
+            continue;
+        };
+        left -= 1;
+        if let Some(a) = at.get_mut(usize::from(*num))
+            && let Some(dst) = buf.get_mut(*a..a.saturating_add(rest.len()))
+        {
+            dst.copy_from_slice(rest);
+            *a = a.saturating_add(rest.len());
+        }
+    }
+    Ok(buf)
+}
+
+/// One extended XMP chunk of the wanted GUID: (offset, full length, data range in the file).
+type ExtChunk = (usize, usize, usize, usize);
+
+fn ext_of(s: &Seg, data: &[u8], guid: &[u8; 32]) -> Option<ExtChunk> {
+    let c = ext_chunk(s.payload(data).strip_prefix(EXT_SIG)?)?;
+    if c.guid != guid.as_slice() || c.data.is_empty() {
+        return None;
+    }
+    Some((c.off, c.full, s.end - c.data.len(), s.end))
+}
+
+/// JPEG extended XMP as ExifTool joins it: the chunks of `guid` (compared exactly) under their
+/// offsets, a later chunk at an offset replacing an earlier one, the full length of the last
+/// chunk; then from offset 0 each chunk leads to the offset after it. `None` unless that chain
+/// ends exactly at the full length ("Incomplete extended XMP": nothing is read).
+fn extended_xmp(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+    guid: &[u8; 32],
+    std_len: usize,
+) -> Result<Option<Vec<u8>>, Error> {
+    let mut n = 0usize;
+    let mut segs = Segments::new(data, limits, budget);
+    while let Item::Seg(s) = segs.step()? {
+        if s.marker == 0xE1 && ext_of(&s, data, guid).is_some() {
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    let charged = n.saturating_mul(size_of::<ExtChunk>());
+    let mut chunks = budget.vec::<ExtChunk>(n)?;
+    let mut segs = Segments::new(data, limits, budget);
+    while let Item::Seg(s) = segs.step()? {
+        if s.marker == 0xE1
+            && chunks.len() < n
+            && let Some(c) = ext_of(&s, data, guid)
+        {
+            chunks.push(c);
+        }
+    }
+    let full = chunks.last().map_or(0, |c| c.1);
+    // By offset, then by file position: the last chunk of an offset is the one that counts.
+    chunks.sort_unstable_by_key(|c| (c.0, c.2));
+    let at = |off: usize| {
+        let i = chunks.partition_point(|c| c.0 <= off);
+        i.checked_sub(1)
+            .and_then(|i| chunks.get(i))
+            .filter(|c| c.0 == off)
+            .copied()
+    };
+    let mut off = 0;
+    while off < full
+        && let Some(c) = at(off)
+    {
+        off += c.3 - c.2;
+    }
+    let result = if off == full && full > 0 {
+        if full
+            .checked_add(std_len)
+            .is_none_or(|t| t > limits.max_xmp_bytes)
+        {
+            budget.release(charged);
+            return Err(Error::LimitExceeded(Limit::XmpBytes));
+        }
+        let mut buf = budget.vec::<u8>(full)?;
+        let mut off = 0;
+        while off < full
+            && let Some(c) = at(off)
+        {
+            buf.extend_from_slice(data.get(c.2..c.3).unwrap_or_default());
+            off += c.3 - c.2;
+        }
+        Some(buf)
+    } else {
+        None
+    };
+    budget.release(charged);
+    Ok(result)
+}
 fn put_exif(out: &mut Vec<u8>, pending: &mut Option<[u8; MIN_EXIF_LEN]>) {
     if let Some(t) = pending.take() {
         out.extend_from_slice(&[0xFF, 0xE1, 0x00, MIN_APP1_LEN]);
@@ -453,7 +560,7 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
         {
             xmp_seen = true;
             let base = s.pstart + XMP_SIG.len();
-            if let Some(r) = xmp_span(b, limits) {
+            if let Some(r) = xmp_span(b, limits, budget)? {
                 xmp = Some((s, base + r.start..base + r.end));
             }
         }

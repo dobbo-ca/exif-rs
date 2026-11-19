@@ -9,6 +9,6 @@ mod common;
 fuzz_target!(|data: &[u8]| {
     let cancel = AtomicBool::new(false);
     if let Ok(e) = exif::Exif::parse(data, &common::small_limits(), &cancel) {
-        common::use_exif(&e, data);
+        common::use_exif(&e, data, &[]);
     }
 });

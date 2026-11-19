@@ -117,10 +117,11 @@ def main():
 
     names = sorted(os.listdir(in_dir))
     containers, file_types, errors, skipped = Counter(), Counter(), Counter(), 0
-    stats = {k: Counter() for k in KEYS + BLOCK_KEYS}
+    stats = {k: Counter() for k in KEYS + BLOCK_KEYS + ["Error"]}
     mismatches, used_known = [], set()
     for name in names:
-        containers[container(os.path.join(in_dir, name))] += 1
+        magic = container(os.path.join(in_dir, name))
+        containers[magic] += 1
         e = et.get(name, {})
         o = oracle.get(name, {"Error": "missing-from-oracle"})
         file_type = e.get("File:FileType")
@@ -128,9 +129,19 @@ def main():
         err = o.get("Error")
         if err is not None:
             errors[err] += 1
-            if err == "unknown-format" and file_type not in READ_TYPES:
+            # Only a file without JPEG, PNG or WebP magic bytes may be refused, as unknown-format.
+            if err == "unknown-format" and magic == "other":
                 skipped += 1
                 continue
+            s = stats["Error"]
+            s["compared"] += 1
+            if (name, "Error") in known:
+                s["known"] += 1
+                used_known.add((name, "Error"))
+            else:
+                s["mismatch"] += 1
+                mismatches.append((name, "Error", show(e.get("ExifTool:Error")), show(err)))
+            continue
         for key in sorted(k for k in set(e) | set(o) if compared(k)):
             s = stats.setdefault(key, Counter())
             s["compared"] += 1
@@ -152,7 +163,7 @@ def main():
         f"Inputs ExifTool reads as JPEG/PNG/WEBP (File:FileType): {read_types}",
         f"ExifTool File:FileType: {counts(file_types)}",
         f"exif-rs errors: {counts(errors)}",
-        f"Skipped (not JPEG/PNG/WEBP for ExifTool, unknown-format for exif-rs): {skipped}",
+        f"Skipped (no JPEG/PNG/WebP magic bytes, unknown-format for exif-rs): {skipped}",
         f"Mismatches: {len(mismatches)} (known differences used: {len(used_known)},"
         f" listed but unused: {len(set(known) - used_known)})",
         "",

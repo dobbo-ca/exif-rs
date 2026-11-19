@@ -28,21 +28,22 @@ COPY . .
 # The checks run in the build, so a red check fails the build; a rerun of the same source is a
 # BuildKit cache hit. The target dirs are cache mounts, so they persist across builds. The target
 # cache is shared by every branch and cargo compares mtimes: another branch's newer build would be
-# reused as this one's, so every RUN that runs cargo touches the sources just before it starts. No
-# SIMD here, so there is no scalar-tier run.
+# reused as this one's, so every RUN that runs cargo touches the sources just before it starts,
+# and holds the cache with sharing=locked, so a concurrent build of another commit cannot build
+# into it between the touch and cargo. No SIMD here, so there is no scalar-tier run.
 FROM src AS ci
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets -- -D warnings
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo build --locked --release --target aarch64-unknown-linux-gnu
 # The fuzz crate (libfuzzer-sys) has to compile; fuzz.yml runs its targets.
-RUN --mount=type=cache,id=exif-fuzz-target,target=/src/tests/fuzz/target \
+RUN --mount=type=cache,id=exif-fuzz-target,target=/src/tests/fuzz/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cd tests/fuzz && cargo check --locked --bins
 
 # qemu-user and the aarch64 cross toolchain, for the arm64 stages.
@@ -62,7 +63,7 @@ COPY . .
 # there are no kernel-only tests to select (what the target changes is deflate-rs's NEON adler32,
 # which every PNG text inflate runs).
 FROM qemu-arm64 AS arm64
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --release --target aarch64-unknown-linux-gnu
 
 # The ExifTool oracle (perl is in the base image) and the Pillow that tests/parity/compare.py and
@@ -81,7 +82,7 @@ COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
 COPY . .
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + \
     && sh tests/parity/fetch.sh /corpus \
@@ -101,7 +102,7 @@ COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
 COPY . .
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + \
     && sh tests/parity/fetch.sh /corpus \
@@ -115,7 +116,8 @@ RUN --mount=type=cache,id=exif-target,target=/src/target \
     && diff /out/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /out/x.jsonl) lines, identical" \
     && for m in all keep orient1; do \
          $x strip $m /work/in /out/x-$m && $a strip $m /work/in /out/a-$m \
-         && diff -r /out/x-$m /out/a-$m && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
+         && diff -r /out/x-$m /out/a-$m && diff /out/x-$m.errors /out/a-$m.errors \
+         && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
        done \
     && rm -rf /out /work/in
 
@@ -142,7 +144,7 @@ COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
 COPY . .
-RUN --mount=type=cache,id=exif-target,target=/src/target \
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + \
     && sh tests/parity/fetch.sh /corpus \

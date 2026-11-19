@@ -34,8 +34,8 @@ fuzz_target!(|data: &[u8]| {
         Ok(m) => m,
         Err(Error::UnknownFormat | Error::Truncated | Error::Malformed(_)) => {
             assert!(
-                input_reads,
-                "output is not a file, input did not read either way"
+                !input_reads,
+                "the input reads as a file but the output does not"
             );
             return;
         }

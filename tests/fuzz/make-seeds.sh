@@ -81,6 +81,18 @@ bytes 3 1 0 2 17 3 17 0 63 0 > "$t/sos"
 } > "$out/jpeg/full.jpg"
 { bytes 255 216; seg 225 "$t/exif.be"; bytes 255 217; } > "$out/jpeg/exif-be.jpg"
 head -c 60 "$out/jpeg/full.jpg" > "$out/jpeg/cut.jpg"
+# A thumbnail that ends past the APP1 block, which read() takes from the file (as ExifTool does):
+# IFD0 with no entries, IFD1 at 14 with offset 44 and length 200, then a 256-byte COM segment.
+{
+  printf 'II*\000'; le32 8; bytes 0 0; le32 14
+  bytes 2 0
+  bytes 1 2 4 0; le32 1; le32 44
+  bytes 2 2 4 0; le32 1; le32 200
+  le32 0; bytes 255 216
+} > "$t/thumb.tiff"
+{ printf 'Exif\000\000'; cat "$t/thumb.tiff"; } > "$t/exif.thumb"
+head -c 256 /dev/zero > "$t/com"
+{ bytes 255 216; seg 225 "$t/exif.thumb"; seg 254 "$t/com"; bytes 255 217; } > "$out/jpeg/thumb-past-app1.jpg"
 
 # ---- PNG: signature, IHDR (1x1 grey), eXIf, iTXt XMP, IDAT (stored zlib block), IEND.
 chunk() { { printf '%s' "$1"; cat "$2"; } > "$t/c"; be32 "$(size "$2")"; cat "$t/c"; be32 "$(crc32 < "$t/c")"; }

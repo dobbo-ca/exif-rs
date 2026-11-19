@@ -511,6 +511,127 @@ fn webp_reset_exif_and_xmp() {
     }
 }
 
+#[test]
+fn orientation_of_any_integer_type_is_kept_and_reset() {
+    // IFD0 Orientation stored as LONG (ExifTool reads any integer type), LE and BE; and an
+    // SSHORT stored out of line with count 3.
+    for be in [false, true] {
+        let long = Ent {
+            tag: 0x0112,
+            typ: 4,
+            count: 1,
+            data: (if be {
+                6u32.to_be_bytes()
+            } else {
+                6u32.to_le_bytes()
+            })
+            .to_vec(),
+        };
+        let t = tiff(be, &[long]);
+        let f = jpeg(&[app1_exif(&t), dqt()]);
+        assert_eq!(orientation_of(&f), Some(6));
+        assert_eq!(
+            run_strip(&f, ORIENTATION),
+            jpeg(&[app1_exif(&min_exif(be, 6)), dqt()])
+        );
+        let out = run_reset(&f);
+        assert_eq!(orientation_of(&out), Some(1));
+        let mut want = f.clone();
+        let at = f.windows(t.len()).position(|w| w == t).unwrap() + ORIENTATION_VALUE_AT;
+        want[at..at + 4].copy_from_slice(&if be { [0, 0, 0, 1] } else { [1, 0, 0, 0] });
+        assert_eq!(out, want);
+    }
+    let sshort = Ent {
+        tag: 0x0112,
+        typ: 8,
+        count: 3,
+        data: [8u16, 7, 6].iter().flat_map(|v| v.to_le_bytes()).collect(),
+    };
+    let t = tiff(false, &[sshort]);
+    let f = png_with(&[chunk(b"eXIf", &t)]);
+    assert_eq!(orientation_of(&f), Some(8));
+    let out = run_reset(&f);
+    assert_eq!(orientation_of(&out), Some(1));
+    assert!(png_chunks(&out).iter().all(|c| c.2));
+}
+
+#[test]
+fn png_reset_without_a_change_keeps_a_wrong_crc() {
+    // No orientation in the eXIf chunk, a wrong stored CRC: the output equals the input.
+    let mut c = chunk(b"eXIf", &tiff(false, &[ascii(0x010F, "Canon")]));
+    let n = c.len();
+    c[n - 1] ^= 0xFF;
+    let f = png_with(&[c]);
+    assert_eq!(run_reset(&f), f);
+    // Orientation already 1 in EXIF and XMP: unchanged too.
+    let mut c = chunk(b"eXIf", &min_exif(false, 1));
+    let n = c.len();
+    c[n - 1] ^= 0xFF;
+    let mut x = itxt_xmp(xmp_attr("1").as_bytes(), false);
+    let n = x.len();
+    x[n - 1] ^= 0xFF;
+    let f = png_with(&[c, x]);
+    assert_eq!(run_reset(&f), f);
+}
+
+#[test]
+fn reset_xmp_scan_follows_the_call_limits_and_cancel() {
+    // tiff:Orientation after 10 property elements: a node limit of 5 is an error, as in read(),
+    // not a silent half reset.
+    let mut body = String::new();
+    for i in 0..10 {
+        body.push_str(&format!("<dc:p{i}>v</dc:p{i}>"));
+    }
+    let x = format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\">{body}<tiff:Orientation>6</tiff:Orientation></rdf:Description></rdf:RDF></x:xmpmeta>"
+    );
+    let files = [
+        png_with(&[
+            chunk(b"eXIf", &min_exif(false, 6)),
+            itxt_xmp(x.as_bytes(), false),
+        ]),
+        jpeg(&[
+            app1_exif(&min_exif(false, 6)),
+            app1_xmp(x.as_bytes()),
+            dqt(),
+        ]),
+        webp(&[vp8(), riff_chunk(b"XMP ", x.as_bytes())]),
+    ];
+    for f in &files {
+        let l = Limits {
+            max_xmp_nodes: 5,
+            ..limits()
+        };
+        assert_eq!(
+            reset_orientation(f, &l, &no_cancel()),
+            Err(Error::LimitExceeded(Limit::XmpNodes))
+        );
+        let l = Limits {
+            max_xmp_bytes: x.len() - 1,
+            ..limits()
+        };
+        assert_eq!(
+            reset_orientation(f, &l, &no_cancel()),
+            Err(Error::LimitExceeded(Limit::XmpBytes))
+        );
+        let out = run_reset(f);
+        let needle = b"<tiff:Orientation>1</tiff:Orientation>";
+        assert!(out.windows(needle.len()).any(|w| w == needle));
+    }
+}
+
+#[test]
+fn reset_changes_the_top_level_xmp_orientation_only() {
+    // A Photoshop Pantry item's tiff:Orientation is a struct field; the top-level value is reset.
+    let x = |o: &str| {
+        format!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:xmpMM=\"http://ns.adobe.com/xap/1.0/mm/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\"><xmpMM:Pantry><rdf:Bag><rdf:li><rdf:Description tiff:Orientation=\"3\"/></rdf:li></rdf:Bag></xmpMM:Pantry><tiff:Orientation>{o}</tiff:Orientation></rdf:Description></rdf:RDF></x:xmpmeta>"
+        )
+    };
+    let f = jpeg(&[app1_xmp(x("6").as_bytes()), dqt()]);
+    assert_eq!(run_reset(&f), jpeg(&[app1_xmp(x("1").as_bytes()), dqt()]));
+}
+
 // ---- errors and limits ----
 
 #[test]

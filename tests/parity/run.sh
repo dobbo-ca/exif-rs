@@ -28,7 +28,20 @@ rm -rf "$work"
 mkdir -p "$work/strip" "$report"
 status=0
 
-echo "inputs: $(sh "$here/inputs.sh" "$corpus" "$work/in" "${PARITY_EVERY_N:-1}")"
+every=${PARITY_EVERY_N:-1}
+n=$(sh "$here/inputs.sh" "$corpus" "$work/in" "$every") || { echo "run.sh: inputs.sh failed" >&2; status=1; }
+case $n in ''|*[!0-9]*) n=0 ;; esac
+echo "inputs: $n"
+# An empty or partial input set must not pass: both sources contribute, and the pinned corpus
+# gives PARITY_MIN_INPUTS inputs (2402 at the fetch.sh commits) divided by every-n.
+min=$((${PARITY_MIN_INPUTS:-2402} / every))
+if [ "$n" -lt "$min" ]; then echo "run.sh: $n inputs, want at least $min" >&2; status=1; fi
+for src in exiftool mei; do
+  if [ -z "$(find "$work/in" -name "${src}__*" | head -n 1)" ]; then
+    echo "run.sh: no $src inputs" >&2
+    status=1
+  fi
+done
 
 # ExifTool exits non-zero when it cannot read a file; that file's JSON still has its Error.
 et "$work/in" > "$work/exiftool.json" 2> "$work/exiftool.stderr"

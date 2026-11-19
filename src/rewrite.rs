@@ -21,7 +21,8 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 /// Removes all metadata from a JPEG, PNG or WebP file, except what `keep` names. The image
 /// data bytes are never changed.
 ///
-/// - JPEG: before the first scan keeps SOI, APP0 `JFIF`, APP14 `Adobe`, APP2 ICC (with
+/// - JPEG: before the first scan keeps SOI, APP0 `JFIF` (as stored, with its thumbnail if it
+///   has one), APP14 `Adobe`, APP2 ICC (with
 ///   `keep.icc`) and every other segment that is not an APPn or COM; from the first scan to
 ///   the EOI the bytes are copied as they are; bytes after the EOI are dropped.
 /// - PNG: keeps the critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM,
@@ -59,23 +60,27 @@ pub fn strip(
     }
 }
 
-/// Sets every orientation value to 1 and changes no other byte: the EXIF IFD0 Orientation
-/// value in place (2 bytes; a PNG `eXIf` chunk gets a new CRC), and the text of the
-/// `tiff:Orientation` value of the XMP packet (the JPEG APP1 length, the PNG chunk length and
-/// CRC, the WebP chunk size, pad byte and RIFF size follow). When there is no orientation the
-/// output equals the input. A truncated file is rewritten as far as it goes.
+/// Sets the orientation values ExifTool reports to 1 and changes no other byte: the first value
+/// of the EXIF IFD0 Orientation in place, in the width of its type (BYTE, SHORT, LONG or
+/// signed; a PNG `eXIf` chunk gets a new CRC), and the text of the first top-level
+/// `tiff:Orientation` of the XMP packet (the JPEG APP1 length, the PNG chunk length and CRC, the
+/// WebP chunk size, pad byte and RIFF size follow). A chunk whose bytes do not change keeps its
+/// CRC. When there is no orientation the output equals the input. A truncated file is
+/// rewritten as far as it goes.
 ///
 /// Only the first EXIF block and the first XMP packet are changed. Not changed: JPEG extended
 /// XMP, a PNG compressed `iTXt` XMP packet, and a PNG ImageMagick raw EXIF profile (`tEXt`,
 /// `zTXt`, `iTXt`); they are copied as they are.
 ///
-/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes).
+/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes), and so is
+/// the scan of the XMP packet, which checks the cancel flag every 1024 nodes.
 ///
 /// # Errors
 ///
 /// [`Error::UnknownFormat`]; [`Error::Malformed`] when a changed JPEG APP1 or PNG chunk would
 /// get too long for its length field; [`Error::LimitExceeded`] for `max_alloc`,
-/// `max_segments` and the XMP limits; [`Error::OutOfMemory`]; [`Error::Cancelled`].
+/// `max_segments`, `max_xmp_bytes` and `max_xmp_nodes` (the XMP packet that is scanned);
+/// [`Error::OutOfMemory`]; [`Error::Cancelled`].
 pub fn reset_orientation(
     data: &[u8],
     limits: &Limits,
@@ -99,15 +104,17 @@ pub(crate) fn kept_exif(
     let Some(block) = block else {
         return Ok(None);
     };
+    // Everything the parse charges is dropped here: give it back with the block.
+    let mark = budget.used();
     let parsed = crate::soft(Exif::parse_with(&block, limits, budget));
+    let kept =
+        parsed.map(|p| p.and_then(|exif| exif.orientation().map(|o| (o, exif.byte_order()))));
+    budget.reset_to(mark);
     budget.release(block.len());
-    let Some(exif) = parsed? else {
+    let Some((v, order)) = kept? else {
         return Ok(None);
     };
-    let Some(v) = exif.orientation() else {
-        return Ok(None);
-    };
-    let be = matches!(exif.byte_order(), ByteOrder::Big);
+    let be = matches!(order, ByteOrder::Big);
     let u16b = |x: u16| if be { x.to_be_bytes() } else { x.to_le_bytes() };
     let u32b = |x: u32| if be { x.to_be_bytes() } else { x.to_le_bytes() };
     let mut t = [0u8; MIN_EXIF_LEN];
@@ -131,18 +138,24 @@ pub(crate) fn kept_exif(
     Ok(Some(t))
 }
 
-/// Sets the IFD0 Orientation value of the EXIF block to 1, in place.
-pub(crate) fn reset_exif_in_place(block: &mut [u8]) {
-    let Some((off, order)) = crate::tiff::orientation_value_offset(block) else {
-        return;
+/// Sets the first IFD0 Orientation value of the EXIF block to 1, in place, in the width of its
+/// type. Returns whether a byte changed.
+pub(crate) fn reset_exif_in_place(block: &mut [u8]) -> bool {
+    let Some((range, order)) = crate::tiff::orientation_value_range(block) else {
+        return false;
     };
-    let one = match order {
-        ByteOrder::Little => [1, 0],
-        ByteOrder::Big => [0, 1],
+    let Some(d) = block.get_mut(range) else {
+        return false;
     };
-    if let Some(end) = off.checked_add(2)
-        && let Some(d) = block.get_mut(off..end)
-    {
-        d.copy_from_slice(&one);
+    let one_at = match order {
+        ByteOrder::Little => 0,
+        ByteOrder::Big => d.len().saturating_sub(1),
+    };
+    let mut changed = false;
+    for (i, b) in d.iter_mut().enumerate() {
+        let v = u8::from(i == one_at);
+        changed |= *b != v;
+        *b = v;
     }
+    changed
 }

@@ -3,7 +3,9 @@
 //! String accessors follow ExifTool 13.64 (`-n` values): the ASCII value up to the first NUL;
 //! `Make` and `Model` also lose trailing whitespace (ExifTool's `s/\s+$//`),
 //! `SubSecTimeOriginal` loses trailing spaces, the other strings are returned as stored. A
-//! string that is not valid UTF-8 gives `None`.
+//! string that is not valid UTF-8 gives `None`. Of two entries with the same tag in one IFD the
+//! accessors read the last one, as ExifTool keeps the last (priority 1); IFD0 Orientation
+//! (priority 0) is the first.
 
 use std::sync::atomic::AtomicBool;
 
@@ -75,7 +77,7 @@ pub struct SRational {
 pub enum Value {
     /// Type 1.
     Byte(Vec<u8>),
-    /// Type 2, as stored (including any NUL).
+    /// Type 2, and type 129 (EXIF 3.0 UTF-8), as stored (including any NUL).
     Ascii(Vec<u8>),
     /// Type 3.
     Short(Vec<u16>),
@@ -153,7 +155,8 @@ pub struct Gps {
     pub longitude_ref: Option<u8>,
     /// 0x0006.
     pub altitude: Option<Rational>,
-    /// 0x0005: 0 above sea level, 1 below.
+    /// 0x0005: 0 above sea level, 1 below (EXIF 3.0 adds 2 and 3); see
+    /// [`altitude_m`](Self::altitude_m) for the sign.
     pub altitude_ref: Option<u8>,
     /// 0x0007: UTC hours, minutes, seconds.
     pub time_stamp: Option<[Rational; 3]>,
@@ -230,8 +233,11 @@ impl Exif {
     /// Parses an EXIF block that starts at the TIFF header (a leading `Exif\0\0` is skipped).
     ///
     /// The walk covers IFD0, IFD1 (linked from IFD0), the Exif and GPS IFDs (IFD0) and the
-    /// Interop IFD (Exif IFD). A bad entry (offset outside the block, unknown type) or a bad
-    /// sub-IFD offset is skipped; a visited IFD offset is never walked twice.
+    /// Interop IFD (Exif IFD), in ExifTool's order: a sub-IFD when its pointer entry is met (the
+    /// Interop IFD inside the Exif IFD), IFD1 after IFD0's sub-IFDs. A bad entry (offset outside
+    /// the block, unknown type) or a bad sub-IFD offset is skipped; a visited IFD offset is never
+    /// walked twice (the IFD walked first keeps it), except that a GPS pointer to the Interop IFD
+    /// rereads it as GPS, as ExifTool does.
     ///
     /// # Errors
     ///
@@ -285,16 +291,36 @@ impl Exif {
             .map(|e| &e.value)
     }
 
-    /// IFD0 Orientation (0x0112), the stored value (first SHORT).
+    /// The value of the last entry with that tag: ExifTool keeps the last of two equal tags of
+    /// priority 1 (every tag the accessors read except IFD0 Orientation).
+    fn last(&self, ifd: IfdKind, tag: u16) -> Option<&Value> {
+        self.entries(ifd)
+            .iter()
+            .rev()
+            .find(|e| e.tag == tag)
+            .map(|e| &e.value)
+    }
+
+    /// IFD0 Orientation (0x0112): the first value of the first entry of an integer type (BYTE,
+    /// SHORT, LONG, SBYTE, SSHORT, SLONG), as ExifTool reads it (priority 0: the first entry
+    /// stays). `None` when there is none or the value is not a `u16`.
     pub fn orientation(&self) -> Option<u16> {
-        match self.get(IfdKind::Ifd0, 0x0112)? {
-            Value::Short(v) => v.first().copied(),
-            _ => None,
-        }
+        self.entries(IfdKind::Ifd0)
+            .iter()
+            .filter(|e| e.tag == 0x0112)
+            .find_map(|e| match &e.value {
+                Value::Byte(v) => v.first().map(|&x| u16::from(x)),
+                Value::Short(v) => v.first().copied(),
+                Value::Long(v) => v.first().and_then(|&x| u16::try_from(x).ok()),
+                Value::SByte(v) => v.first().and_then(|&x| u16::try_from(x).ok()),
+                Value::SShort(v) => v.first().and_then(|&x| u16::try_from(x).ok()),
+                Value::SLong(v) => v.first().and_then(|&x| u16::try_from(x).ok()),
+                _ => None,
+            })
     }
 
     fn ascii(&self, ifd: IfdKind, tag: u16) -> Option<&str> {
-        match self.get(ifd, tag)? {
+        match self.last(ifd, tag)? {
             Value::Ascii(b) => {
                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
                 std::str::from_utf8(b.get(..end)?).ok()
@@ -303,13 +329,13 @@ impl Exif {
         }
     }
 
-    /// IFD0 Make (0x010F), trailing whitespace removed as ExifTool does.
+    /// IFD0 Make (0x010F, the last entry), trailing whitespace removed as ExifTool does.
     pub fn make(&self) -> Option<&str> {
         self.ascii(IfdKind::Ifd0, 0x010F)
             .map(|s| s.trim_end_matches(perl_space))
     }
 
-    /// IFD0 Model (0x0110), trailing whitespace removed as ExifTool does.
+    /// IFD0 Model (0x0110, the last entry), trailing whitespace removed as ExifTool does.
     pub fn model(&self) -> Option<&str> {
         self.ascii(IfdKind::Ifd0, 0x0110)
             .map(|s| s.trim_end_matches(perl_space))
@@ -337,14 +363,14 @@ impl Exif {
     }
 
     fn rational(&self, ifd: IfdKind, tag: u16) -> Option<Rational> {
-        match self.get(ifd, tag)? {
+        match self.last(ifd, tag)? {
             Value::Rational(v) => v.first().copied(),
             _ => None,
         }
     }
 
     fn rationals3(&self, ifd: IfdKind, tag: u16) -> Option<[Rational; 3]> {
-        match self.get(ifd, tag)? {
+        match self.last(ifd, tag)? {
             Value::Rational(v) => match v.as_slice() {
                 [a, b, c, ..] => Some([*a, *b, *c]),
                 _ => None,
@@ -354,7 +380,7 @@ impl Exif {
     }
 
     fn uint(&self, ifd: IfdKind, tag: u16) -> Option<u32> {
-        match self.get(ifd, tag)? {
+        match self.last(ifd, tag)? {
             Value::Short(v) => v.first().map(|&x| u32::from(x)),
             Value::Long(v) => v.first().copied(),
             _ => None,
@@ -362,7 +388,7 @@ impl Exif {
     }
 
     fn first_byte(&self, ifd: IfdKind, tag: u16) -> Option<u8> {
-        match self.get(ifd, tag)? {
+        match self.last(ifd, tag)? {
             Value::Ascii(v) | Value::Byte(v) | Value::Undefined(v) => v.first().copied(),
             _ => None,
         }
@@ -406,7 +432,7 @@ impl Exif {
 
     /// The raw maker note (Exif 0x927C); never parsed.
     pub fn maker_note(&self) -> Option<&[u8]> {
-        match self.get(IfdKind::Exif, 0x927C)? {
+        match self.last(IfdKind::Exif, 0x927C)? {
             Value::Undefined(v) | Value::Byte(v) => Some(v.as_slice()),
             _ => None,
         }

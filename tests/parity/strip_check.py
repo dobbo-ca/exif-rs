@@ -5,7 +5,8 @@ usage: strip_check.py <in-dir> <exiftool.json> <strip-dir> <report-dir>
 
 <strip-dir>/<mode>/ holds the outputs of mode all, keep and orient1, <strip-dir>/<mode>.json
 ExifTool's JSON of them and <strip-dir>/<mode>.errors the files exif-rs refused. Writes
-<report-dir>/strip.md and <report-dir>/strip-failures.tsv. Exits 1 on any failure.
+<report-dir>/strip.md and <report-dir>/strip-failures.tsv. Exits 1 on any failure: a check of an
+output, or a refusal of a JPEG/PNG/WebP input that strip-refusals.tsv does not list.
 """
 
 import hashlib
@@ -16,9 +17,10 @@ from collections import Counter
 
 from PIL import Image
 
-from compare import Num, canon, load_json, by_name, counts
+from compare import Num, canon, container, load_json, by_name, counts
 
 MODES = ("all", "keep", "orient1")
+REFUSALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strip-refusals.tsv")
 
 # Tags a fully stripped file may still have: file facts and image structure, no metadata.
 OPEN_GROUPS = {"ExifTool", "System", "JFIF", "Adobe", "PNG-pHYs", "PNG-cICP"}
@@ -65,8 +67,22 @@ def keys(d):
     return [k for k in d if k != "SourceFile"]
 
 
+def check_file(orig, out):
+    """An output of an original ExifTool reads without error must read without error and keep
+    its MIME type (File:FileType may change: a WebP file that gets a VP8X chunk is Extended)."""
+    if "ExifTool:Error" in orig:
+        return []
+    fails = []
+    if "ExifTool:Error" in out:
+        fails.append(f"ExifTool:Error {canon(out['ExifTool:Error'])}"[:300])
+    want, got = canon(orig.get("File:MIMEType")), canon(out.get("File:MIMEType"))
+    if want != got:
+        fails.append(f"File:MIMEType: original {want} output {got}"[:300])
+    return fails
+
+
 def check_all(orig, out):
-    return [f"{k} remains" for k in keys(out) if not allowed(k)]
+    return [f"{k} remains" for k in keys(out) if not allowed(k)] + check_file(orig, out)
 
 
 def check_keep(orig, out):
@@ -77,7 +93,7 @@ def check_keep(orig, out):
             fails.append(f"{k}: original {canon(orig.get(k))} output {canon(out.get(k))}"[:300])
     if "File:ExifByteOrder" in out and "IFD0:Orientation" not in out:
         fails.append("File:ExifByteOrder without IFD0:Orientation")
-    return fails
+    return fails + check_file(orig, out)
 
 
 def check_orient1(orig, out):
@@ -108,29 +124,57 @@ def frames(path):
         return out
 
 
+def load_refusals(path):
+    """file -> error class of the refusals strip makes on purpose (modes all and keep)."""
+    out = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if line.startswith("#") or len(parts) < 2:
+                    continue
+                out[parts[0]] = parts[1]
+    return out
+
+
 def main():
     in_dir, et_path, strip_dir, report = sys.argv[1:5]
     warnings.simplefilter("ignore")
     orig = by_name(load_json(et_path))
+    pinned = load_refusals(REFUSALS)
     orig_pixels = {}
     failures = []
     lines = [
         "## Strip checks",
         "",
-        "| mode | outputs | exif-rs errors | tag failures | pixel checked | identical"
-        " | pixel failures | pixel skipped |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| mode | outputs | exif-rs errors | unexpected refusals | tag failures | pixel checked"
+        " | identical | pixel failures | pixel skipped |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     notes = []
     for mode in MODES:
         out_dir = os.path.join(strip_dir, mode)
         out = by_name(load_json(os.path.join(strip_dir, mode + ".json")))
-        errors = Counter()
+        refused = {}
         errors_path = os.path.join(strip_dir, mode + ".errors")
         if os.path.exists(errors_path):
             with open(errors_path, encoding="utf-8") as f:
-                errors.update(line.rstrip("\n").split("\t")[-1] for line in f if line.strip())
+                for line in f:
+                    if line.strip():
+                        name, _, cls = line.rstrip("\n").rpartition("\t")
+                        refused[name] = cls
+        errors = Counter(refused.values())
         c, skips = Counter(), Counter()
+        # A file without JPEG/PNG/WebP magic is refused as unknown-format; a JPEG/PNG/WebP file
+        # only when strip-refusals.tsv lists it with that class (never by reset_orientation).
+        for name, cls in sorted(refused.items()):
+            if container(os.path.join(in_dir, name)) == "other":
+                expected = cls == "unknown-format"
+            else:
+                expected = mode != "orient1" and pinned.get(name) == cls
+            if not expected:
+                c["unexpected refusals"] += 1
+                failures.append((mode, name, "refused", cls))
         names = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
         for name in names:
             c["outputs"] += 1
@@ -160,9 +204,9 @@ def main():
                 c["pixel failures"] += 1
                 failures.append((mode, name, "pixels", got if isinstance(got, str) else "differ"))
         lines.append(
-            f"| {mode} | {c['outputs']} | {sum(errors.values())} | {c['tag failures']}"
-            f" | {c['pixel checked']} | {c['identical']} | {c['pixel failures']}"
-            f" | {sum(skips.values())} |"
+            f"| {mode} | {c['outputs']} | {sum(errors.values())} | {c['unexpected refusals']}"
+            f" | {c['tag failures']} | {c['pixel checked']} | {c['identical']}"
+            f" | {c['pixel failures']} | {sum(skips.values())} |"
         )
         notes.append(f"- {mode}: exif-rs errors: {counts(errors)}; pixel skips: {counts(skips)}")
     lines += [""] + notes

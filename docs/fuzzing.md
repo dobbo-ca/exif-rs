@@ -32,4 +32,4 @@ Dispatch a 15-minute run per target:
 gh workflow run fuzz.yml --ref <branch> -f max_total_time=900
 ```
 
-The default is 600 s. The seed corpus is the parity corpus under `tests/data`.
+The default is 600 s. The seeds are small synthetic files that `tests/fuzz/make-seeds.sh` writes in the fuzz image; the corpus each run grows is kept in the Actions cache.

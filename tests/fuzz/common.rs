@@ -30,8 +30,9 @@ const KINDS: [fn() -> IfdKind; 5] = [
     || IfdKind::Ifd1,
 ];
 
-/// Calls every accessor of `e`, parsed from `tiff`.
-pub fn use_exif(e: &Exif, tiff: &[u8]) {
+/// Calls every accessor of `e`, parsed from `tiff`; `file` is the input file when `e` came from
+/// `read` (a JPEG thumbnail may be read from the file past the APP1 block), else empty.
+pub fn use_exif(e: &Exif, tiff: &[u8], file: &[u8]) {
     let _ = e.byte_order();
     for kind in KINDS {
         for en in e.entries(kind()) {
@@ -55,14 +56,17 @@ pub fn use_exif(e: &Exif, tiff: &[u8]) {
         assert!(m.len() <= tiff.len(), "maker note longer than the block");
     }
     if let Some(t) = e.thumbnail() {
-        assert!(t.len() <= tiff.len(), "thumbnail longer than the block");
+        assert!(
+            t.len() <= tiff.len().max(file.len()),
+            "thumbnail longer than the block and the file"
+        );
     }
 }
 
 /// Calls every accessor of `x`.
 pub fn use_xmp(x: &Xmp) {
     let _ = x.raw();
-    for p in x.properties() {
+    for p in x.properties().iter().filter(|p| p.top_level) {
         assert!(x.get(&p.ns, &p.name).is_some(), "get misses a property");
     }
     let _ = (x.orientation(), x.create_date(), x.rating());
@@ -97,7 +101,7 @@ pub fn container(data: &[u8]) {
                 );
                 assert_eq!(m.raw.icc, raw.icc, "read and extract differ");
                 if let (Some(e), Some(t)) = (&m.exif, &m.raw.exif) {
-                    use_exif(e, t);
+                    use_exif(e, t, data);
                 }
                 if let Some(x) = &m.xmp {
                     use_xmp(x);

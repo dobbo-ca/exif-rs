@@ -471,11 +471,67 @@ fn file_order_and_duplicates_are_kept() {
 }
 
 #[test]
-fn orientation_must_be_a_short() {
+fn orientation_is_the_first_integer_entry() {
+    // ExifTool reads any integer type (no Format for 0x0112).
     let data = tiff_ifd0(true, |t| vec![t.long(0x0112, &[6])]);
-    assert_eq!(parse(&data, &lim()).unwrap().orientation(), None);
+    assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(6));
     let data = tiff_ifd0(false, |t| vec![t.short(0x0112, &[8])]);
     assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(8));
+    let data = tiff_ifd0(true, |t| vec![t.byte(0x0112, &[3])]);
+    assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(3));
+    // Not an integer, or out of range: skipped.
+    let data = tiff_ifd0(true, |t| {
+        vec![
+            t.ascii(0x0112, "6"),
+            t.long(0x0112, &[70_000]),
+            t.ent(0x0112, 8, 1, (-1i16).to_le_bytes().to_vec()),
+            t.short(0x0112, &[5]),
+        ]
+    });
+    assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(5));
+}
+
+#[test]
+fn accessors_read_the_last_of_duplicate_tags() {
+    // ExifTool keeps the last of two priority-1 tags (Make, LensModel, ISO, GPS ...).
+    let data = tiff_ifd0(true, |t| {
+        vec![
+            t.ascii(0x010F, "Canon"),
+            t.short(0x0112, &[3]),
+            t.ascii(0x010F, "Nikon"),
+            t.short(0x0112, &[6]),
+        ]
+    });
+    let x = parse(&data, &lim()).unwrap();
+    assert_eq!(x.make(), Some("Nikon"));
+    assert_eq!(x.orientation(), Some(3));
+    let data = tiff_sub(0x8769, |t| {
+        vec![
+            t.short(0x8827, &[100]),
+            t.ascii(0xA434, "A"),
+            t.short(0x8827, &[200]),
+            t.ascii(0xA434, "B"),
+        ]
+    });
+    let x = parse(&data, &lim()).unwrap();
+    assert_eq!(x.exposure().iso, Some(200));
+    assert_eq!(x.lens_model(), Some("B"));
+    let data = tiff_sub(0x8825, |t| vec![t.ascii(0x0001, "N"), t.ascii(0x0001, "S")]);
+    assert_eq!(
+        parse(&data, &lim()).unwrap().gps().unwrap().latitude_ref,
+        Some(b'S')
+    );
+}
+
+#[test]
+fn utf8_type_129_is_read_as_text() {
+    let data = tiff_ifd0(true, |t| vec![t.ent(0x010F, 129, 6, b"Canon\0".to_vec())]);
+    let x = parse(&data, &lim()).unwrap();
+    assert_eq!(x.make(), Some("Canon"));
+    assert_eq!(
+        x.get(IfdKind::Ifd0, 0x010F),
+        Some(&Value::Ascii(b"Canon\0".to_vec()))
+    );
 }
 
 #[test]
@@ -532,6 +588,64 @@ fn sub_ifd_pointers_to_visited_ifds_are_skipped() {
     let x = parse(&t.finish(ifd0), &lim()).unwrap();
     assert_eq!(x.entries(IfdKind::Exif).len(), 1);
     assert!(x.entries(IfdKind::Gps).is_empty());
+}
+
+#[test]
+fn shared_offsets_go_to_the_ifd_exiftool_walks_first() {
+    // ExifTool walks a sub-IFD when it meets the pointer entry and IFD1 after IFD0's entries.
+    // IFD0 next pointer == Exif IFD offset: the IFD is the Exif IFD, IFD1 is empty.
+    let mut t = T::new(true);
+    let e0 = [t.long(0x8769, &[26])];
+    let ifd0 = t.put_ifd(&e0, 26);
+    let e1 = [t.ascii(0x9003, "2020:01:02 03:04:05")];
+    let exif = t.put_ifd(&e1, 0);
+    assert_eq!((ifd0, exif), (8, 26));
+    let x = parse(&t.finish(ifd0), &lim()).unwrap();
+    assert_eq!(tags(&x, IfdKind::Exif), [0x9003]);
+    assert!(x.entries(IfdKind::Ifd1).is_empty());
+    assert_eq!(
+        x.capture_time().map(|c| c.date_time),
+        Some("2020:01:02 03:04:05".to_string())
+    );
+
+    // Interop pointer == IFD1 offset: the Interop IFD has it, so there is no thumbnail.
+    let mut t = T::new(true);
+    let thumb = t.put_bytes(&THUMB);
+    let e = [
+        t.long(0x0201, &[thumb]),
+        t.long(0x0202, &[THUMB.len() as u32]),
+    ];
+    let shared = t.put_ifd(&e, 0);
+    let e = [t.long(0xA005, &[shared])];
+    let exif = t.put_ifd(&e, 0);
+    let e0 = [t.long(0x8769, &[exif])];
+    let ifd0 = t.put_ifd(&e0, shared);
+    let x = parse(&t.finish(ifd0), &lim()).unwrap();
+    assert_eq!(tags(&x, IfdKind::Interop), [0x0201, 0x0202]);
+    assert!(x.entries(IfdKind::Ifd1).is_empty());
+    assert_eq!(x.thumbnail(), None);
+
+    // GPS listed before Exif, both at one offset: GPS has it.
+    let mut t = T::new(true);
+    let e = [t.short(0x0100, &[1])];
+    let sub = t.put_ifd(&e, 0);
+    let e0 = [t.long(0x8825, &[sub]), t.long(0x8769, &[sub])];
+    let ifd0 = t.put_ifd(&e0, 0);
+    let x = parse(&t.finish(ifd0), &lim()).unwrap();
+    assert_eq!(x.entries(IfdKind::Gps).len(), 1);
+    assert!(x.entries(IfdKind::Exif).is_empty());
+
+    // GPS at the Interop IFD's offset is read again as GPS (ExifTool's Windows Phone patch).
+    let mut t = T::new(true);
+    let e = [t.ascii(0x0001, "N")];
+    let shared = t.put_ifd(&e, 0);
+    let e = [t.long(0xA005, &[shared])];
+    let exif = t.put_ifd(&e, 0);
+    let e0 = [t.long(0x8769, &[exif]), t.long(0x8825, &[shared])];
+    let ifd0 = t.put_ifd(&e0, 0);
+    let x = parse(&t.finish(ifd0), &lim()).unwrap();
+    assert_eq!(tags(&x, IfdKind::Interop), [0x0001]);
+    assert_eq!(tags(&x, IfdKind::Gps), [0x0001]);
 }
 
 #[test]

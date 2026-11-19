@@ -3,6 +3,8 @@
 //! Layout follows the TIFF 6.0 / EXIF 2.32 structure. ExifTool 13.64 is the behavioural
 //! reference (no code is copied): a bad entry or a bad sub-IFD offset is skipped, never an error.
 
+use std::ops::Range;
+
 use crate::budget::Budget;
 use crate::exif::{ByteOrder, Entry, Exif, IfdKind, Rational, SRational, Value};
 use crate::{Error, Limit, Limits};
@@ -15,6 +17,8 @@ const TAG_THUMB_OFFSET: u16 = 0x0201;
 const TAG_THUMB_LENGTH: u16 = 0x0202;
 const TAG_ORIENTATION: u16 = 0x0112;
 const ENTRY_SIZE: usize = 12;
+/// EXIF 3.0 UTF-8 string type, read like ASCII (as ExifTool 13.64 does).
+const TYPE_UTF8: u16 = 129;
 
 /// The first `N` bytes of `b`, zero padded when `b` is shorter (callers pass checked slices).
 fn arr<const N: usize>(b: &[u8]) -> [u8; N] {
@@ -84,7 +88,7 @@ fn header(tiff: &[u8]) -> Result<(usize, &[u8], ByteOrder), Error> {
 
 fn type_size(typ: u16) -> Option<usize> {
     match typ {
-        1 | 2 | 6 | 7 => Some(1),
+        1 | 2 | 6 | 7 | TYPE_UTF8 => Some(1),
         3 | 8 => Some(2),
         4 | 9 | 11 | 13 => Some(4),
         5 | 10 | 12 => Some(8),
@@ -102,7 +106,7 @@ fn decode(
 ) -> Result<Option<Value>, Error> {
     Ok(Some(match typ {
         1 => Value::Byte(budget.copy(data)?),
-        2 => Value::Ascii(budget.copy(data)?),
+        2 | TYPE_UTF8 => Value::Ascii(budget.copy(data)?),
         7 => Value::Undefined(budget.copy(data)?),
         6 => {
             let mut v = budget.vec::<i8>(count)?;
@@ -196,7 +200,9 @@ struct Walk<'a, 'b> {
     limits: &'a Limits,
     budget: &'a Budget<'b>,
     ifds: [Vec<Entry>; 5],
-    visited: Vec<usize>,
+    /// The offsets walked, with the kind each was walked as. At most 5 entries (one IFD of each
+    /// kind, plus GPS over Interop), so this is not input sized.
+    visited: Vec<(usize, IfdKind)>,
     total_entries: usize,
     value_bytes: usize,
     thumbnail: Option<Vec<u8>>,
@@ -211,16 +217,16 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    /// Walks one IFD and queues the IFDs it points to. A bad offset skips the IFD.
-    fn ifd(
-        &mut self,
-        off: usize,
-        kind: IfdKind,
-        depth: usize,
-        queue: &mut Vec<(usize, IfdKind, usize)>,
-    ) -> Result<(), Error> {
+    /// Walks one IFD, then the IFDs it points to in ExifTool's order: each sub-IFD when its
+    /// pointer entry is met (depth first, so the Interop IFD inside the Exif IFD), and IFD1
+    /// (IFD0's next pointer) after all of them. A bad offset skips the IFD; so does an offset
+    /// already walked (the first kind keeps it), except that GPS may reread an Interop IFD (as
+    /// ExifTool does, for a wrong Windows Phone pointer).
+    fn ifd(&mut self, off: usize, kind: IfdKind, depth: usize) -> Result<(), Error> {
         let dir = at(self.body, off);
-        if off < 8 || dir.len() < 2 || self.visited.contains(&off) {
+        let seen = self.visited.iter().find(|v| v.0 == off).map(|v| v.1);
+        let reread = kind == IfdKind::Gps && seen == Some(IfdKind::Interop);
+        if off < 8 || dir.len() < 2 || (seen.is_some() && !reread) {
             return Ok(());
         }
         if depth > self.limits.max_depth {
@@ -229,7 +235,7 @@ impl Walk<'_, '_> {
         if self.visited.len() >= self.limits.max_ifds {
             return Err(Error::LimitExceeded(Limit::Ifds));
         }
-        self.visited.push(off);
+        self.visited.push((off, kind));
         self.budget.check_cancel()?;
 
         let stated = usize::from(self.rd.u16(dir));
@@ -242,7 +248,8 @@ impl Walk<'_, '_> {
             return Err(Error::LimitExceeded(Limit::TotalEntries));
         }
         let mut entries = self.budget.vec::<Entry>(n)?;
-        let (mut exif_ptr, mut gps_ptr, mut interop_ptr) = (None, None, None);
+        // The sub-IFD pointers in entry order (the first pointer of each kind).
+        let mut subs: [Option<(usize, IfdKind)>; 2] = [None; 2];
         let (mut thumb_off, mut thumb_len) = (None, None);
 
         for e in at(dir, 2).as_chunks::<ENTRY_SIZE>().0.iter().take(n) {
@@ -263,14 +270,20 @@ impl Walk<'_, '_> {
             let Some(value) = decode(typ, data, count, self.rd, self.budget)? else {
                 continue;
             };
-            let ptr = match &value {
-                Value::Long(v) => v.first().map(|&p| to_usize(p)),
+            let sub = match (kind, tag) {
+                (IfdKind::Ifd0, TAG_EXIF_IFD) => Some(IfdKind::Exif),
+                (IfdKind::Ifd0, TAG_GPS_IFD) => Some(IfdKind::Gps),
+                (IfdKind::Exif, TAG_INTEROP_IFD) => Some(IfdKind::Interop),
                 _ => None,
             };
+            if let (Some(k), Value::Long(v)) = (sub, &value)
+                && let Some(&p) = v.first()
+                && !subs.iter().flatten().any(|s| s.1 == k)
+                && let Some(slot) = subs.iter_mut().find(|s| s.is_none())
+            {
+                *slot = Some((to_usize(p), k));
+            }
             match (kind, tag) {
-                (IfdKind::Ifd0, TAG_EXIF_IFD) => exif_ptr = exif_ptr.or(ptr),
-                (IfdKind::Ifd0, TAG_GPS_IFD) => gps_ptr = gps_ptr.or(ptr),
-                (IfdKind::Exif, TAG_INTEROP_IFD) => interop_ptr = interop_ptr.or(ptr),
                 (IfdKind::Ifd1, TAG_THUMB_OFFSET) => thumb_off = thumb_off.or(first_uint(&value)),
                 (IfdKind::Ifd1, TAG_THUMB_LENGTH) => thumb_len = thumb_len.or(first_uint(&value)),
                 _ => {}
@@ -294,23 +307,16 @@ impl Walk<'_, '_> {
             }
         }
 
+        for (p, k) in subs.into_iter().flatten() {
+            self.ifd(p, k, depth + 1)?;
+        }
         if kind == IfdKind::Ifd0 {
             let np = 2 + stated * ENTRY_SIZE;
             if let Some(b) = dir.get(np..np + 4) {
                 let next = self.rd.u32(b);
                 if next != 0 {
-                    queue.push((to_usize(next), IfdKind::Ifd1, 0));
+                    self.ifd(to_usize(next), IfdKind::Ifd1, 0)?;
                 }
-            }
-        }
-        let child = depth + 1;
-        for (ptr, k) in [
-            (exif_ptr, IfdKind::Exif),
-            (gps_ptr, IfdKind::Gps),
-            (interop_ptr, IfdKind::Interop),
-        ] {
-            if let Some(p) = ptr {
-                queue.push((p, k, child));
             }
         }
         Ok(())
@@ -347,14 +353,7 @@ pub(crate) fn parse(
         value_bytes: 0,
         thumbnail: None,
     };
-    // At most IFD0, Exif, GPS, IFD1 and Interop are ever queued (one pointer tag of each kind
-    // is followed), so this queue is not input sized.
-    let mut queue = vec![(ifd0, IfdKind::Ifd0, 0)];
-    let mut i = 0;
-    while let Some(&(off, kind, depth)) = queue.get(i) {
-        i += 1;
-        walk.ifd(off, kind, depth, &mut queue)?;
-    }
+    walk.ifd(ifd0, IfdKind::Ifd0, 0)?;
     Ok(Exif {
         order,
         ifds: walk.ifds,
@@ -362,9 +361,10 @@ pub(crate) fn parse(
     })
 }
 
-/// The byte offset in `tiff` of the 2-byte inline value of IFD0 Orientation (0x0112, SHORT,
-/// count 1), and the byte order. The offset counts a leading `Exif\0\0` when `tiff` has one.
-pub(crate) fn orientation_value_offset(tiff: &[u8]) -> Option<(usize, ByteOrder)> {
+/// The byte range in `tiff` of the first value of IFD0 Orientation (0x0112, the first entry
+/// of an integer type: BYTE, SHORT, LONG, SBYTE, SSHORT or SLONG, inline or out of line), and
+/// the byte order. The range counts a leading `Exif\0\0` when `tiff` has one.
+pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, ByteOrder)> {
     let (skip, body, order) = header(tiff).ok()?;
     let rd = Rd(order);
     let ifd = to_usize(rd.u32(at(body, 4)));
@@ -377,9 +377,29 @@ pub(crate) fn orientation_value_offset(tiff: &[u8]) -> Option<(usize, ByteOrder)
         .take(stated)
         .enumerate()
     {
-        if rd.u16(e) == TAG_ORIENTATION && rd.u16(at(e, 2)) == 3 && rd.u32(at(e, 4)) == 1 {
-            return Some((skip + ifd + 2 + k * ENTRY_SIZE + 8, order));
+        if rd.u16(e) != TAG_ORIENTATION {
+            continue;
         }
+        let width = match rd.u16(at(e, 2)) {
+            1 | 6 => 1,
+            3 | 8 => 2,
+            4 | 9 => 4,
+            _ => continue,
+        };
+        let count = to_usize(rd.u32(at(e, 4)));
+        let Some(size) = width.checked_mul(count).filter(|&s| s > 0) else {
+            continue;
+        };
+        let start = if size <= 4 {
+            ifd + 2 + k * ENTRY_SIZE + 8
+        } else {
+            to_usize(rd.u32(at(e, 8)))
+        };
+        // The walk skips an entry whose value does not fit in the block; so does this.
+        if start.checked_add(size).is_none_or(|end| end > body.len()) {
+            continue;
+        }
+        return Some((skip + start..skip + start + width, order));
     }
     None
 }

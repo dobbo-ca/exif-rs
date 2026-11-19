@@ -121,6 +121,42 @@ fn structure_fields_are_properties() {
     );
     let x = parse(&p).unwrap();
     assert_eq!(props(&x), [(EXIF, "Fired", "True"), (EXIF, "Mode", "1")]);
+    // Structure fields are not top-level: get() does not see them.
+    assert!(x.properties().iter().all(|p| !p.top_level));
+    assert_eq!(x.get(EXIF, "Fired"), None);
+}
+
+#[test]
+fn nested_descriptions_are_not_top_level() {
+    // A Photoshop xmpMM:Pantry item is an rdf:Description inside an rdf:li: its attributes are
+    // struct fields (ExifTool: XMP-xmpMM:PantryOrientation), not tiff:Orientation.
+    let p = packet(
+        "xmlns:xmpMM=\"http://ns.adobe.com/xap/1.0/mm/\"",
+        "<xmpMM:Pantry><rdf:Bag><rdf:li><rdf:Description tiff:Orientation=\"1\" xmp:Rating=\"2\"/>\
+         </rdf:li></rdf:Bag></xmpMM:Pantry><tiff:Orientation>6</tiff:Orientation>",
+    );
+    let x = parse(&p).unwrap();
+    assert_eq!(
+        props(&x),
+        [
+            (TIFF, "Orientation", "1"),
+            (XMP, "Rating", "2"),
+            (TIFF, "Orientation", "6")
+        ]
+    );
+    let top: Vec<bool> = x.properties().iter().map(|p| p.top_level).collect();
+    assert_eq!(top, [false, false, true]);
+    assert_eq!(x.orientation(), Some(6));
+    assert_eq!(x.rating(), None);
+    // Arrays of a top-level property are top-level; a second top-level description too.
+    let p = format!(
+        "{HEAD}<rdf:Description {NSDECL}><dc:subject><rdf:Bag><rdf:li>a</rdf:li></rdf:Bag>\
+         </dc:subject></rdf:Description><rdf:Description {NSDECL} xmp:Rating=\"3\"/>{TAIL}"
+    );
+    let x = parse(p.as_bytes()).unwrap();
+    assert!(x.properties().iter().all(|p| p.top_level));
+    assert_eq!(x.get(DC, "subject"), Some("a"));
+    assert_eq!(x.rating(), Some("3"));
 }
 
 #[test]
@@ -213,8 +249,8 @@ fn extended_packet_comes_last() {
             (XMP, "Rating", "5"),
         ]
     );
-    // The first Rating wins.
-    assert_eq!(x.rating(), Some("1"));
+    // The last Rating wins (ExifTool keeps the last), the extended packet's here.
+    assert_eq!(x.rating(), Some("5"));
 }
 
 #[test]
@@ -277,7 +313,8 @@ fn malformed_xml_keeps_what_was_parsed() {
     // Mismatched closing tags and stray text.
     let p = packet("", "text </nope> <dc:a>1</dc:zzz><dc:b>2</dc:b>");
     let x = parse(&p).unwrap();
-    assert_eq!(x.get(DC, "b"), Some("2"));
+    // dc:a is never closed, so dc:b is read inside it (a structure field, not top-level).
+    assert!(props(&x).contains(&(DC, "b", "2")));
 }
 
 #[test]

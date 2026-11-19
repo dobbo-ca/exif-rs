@@ -150,6 +150,89 @@ fn extended_xmp_chunk_past_the_declared_length_is_ignored() {
 }
 
 #[test]
+fn incomplete_extended_xmp_is_none() {
+    // One chunk of a 200-byte packet: ExifTool warns "Incomplete extended XMP" and reads none.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 200, 0, &[b'x'; 100]),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+    // A gap between chunks: none either.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 10, 0, b"0123"),
+        app1_ext(GUID_A, 10, 6, b"6789"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+    // A later chunk at the same offset replaces the earlier one.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 4, 0, b"abcd"),
+        app1_ext(GUID_A, 4, 0, b"wxyz"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp_extended.as_deref(), Some(&b"wxyz"[..]));
+}
+
+#[test]
+fn extended_xmp_guid_is_compared_exactly() {
+    let lower = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(lower, 4, 0, b"abcd"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+}
+
+#[test]
+fn icc_chunk_numbers_as_exiftool_reads_them() {
+    // A total of 0 (written by some software): the first chunk is the profile.
+    let f = jpeg(&[app2_icc(0, 0, b"aa"), app2_icc(1, 0, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aa"[..]));
+    // Numbered from 0.
+    let f = jpeg(&[app2_icc(1, 2, b"bb"), app2_icc(0, 2, b"aa")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aabb"[..]));
+    // A repeated number is appended and counts toward the total.
+    let f = jpeg(&[app2_icc(1, 2, b"aa"), app2_icc(1, 2, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aabb"[..]));
+    // Another total before the profile is complete: none.
+    let f = jpeg(&[app2_icc(1, 2, b"aa"), app2_icc(2, 3, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.icc.is_none());
+}
+
+#[test]
+fn multi_segment_exif_is_joined() {
+    // IFD0 (no entries) -> IFD1 at 14 with a 4-byte thumbnail at 44; the first APP1 ends at 44,
+    // the thumbnail is in the second APP1 (`Exif\0\0` and no TIFF header), as ExifTool joins it.
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 44u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0]);
+    assert_eq!(t.len(), 44);
+    let thumb = [0xFF, 0xD8, 0xFF, 0xD9];
+    let f = jpeg(&[app1_exif(&t), app1_exif(&thumb), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.raw.exif, Some([&t[..], &thumb[..]].concat()));
+    assert_eq!(meta.exif.unwrap().thumbnail(), Some(&thumb[..]));
+    // Not next to each other: not joined, and the thumbnail is not read across the segments.
+    let f = jpeg(&[app1_exif(&t), dqt(), app1_exif(&thumb)]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.raw.exif, Some(t.clone()));
+    assert_ne!(meta.exif.unwrap().thumbnail(), Some(&thumb[..]));
+}
+
+#[test]
 fn not_a_jpeg() {
     assert_eq!(
         extract(b"hello world", &limits(), &no_cancel()),
@@ -275,7 +358,7 @@ fn limit_max_alloc() {
         Err(Error::LimitExceeded(Limit::Alloc))
     );
     let std = std_xmp_attr(GUID_A);
-    let f = jpeg(&[app1_xmp(&std), app1_ext(GUID_A, 1000, 0, b"0123456789")]);
+    let f = jpeg(&[app1_xmp(&std), app1_ext(GUID_A, 1000, 0, &[b'x'; 1000])]);
     let l = Limits {
         max_alloc: std.len() + 100,
         ..limits()
