@@ -380,7 +380,7 @@ pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, Byte
         if rd.u16(e) != TAG_ORIENTATION {
             continue;
         }
-        let width = match rd.u16(at(e, 2)) {
+        let width: usize = match rd.u16(at(e, 2)) {
             1 | 6 => 1,
             3 | 8 => 2,
             4 | 9 => 4,
