@@ -185,5 +185,5 @@ pub(crate) fn xmp_span(packet: &[u8], limits: &Limits) -> Option<Range<usize>> {
 
 /// Replaces the bytes at `span` of `out` by `1`. `out` has room for one more byte.
 pub(crate) fn splice_one(out: &mut Vec<u8>, span: Range<usize>) {
-    out.splice(span, [b'1']).for_each(drop);
+    out.splice(span, *b"1").for_each(drop);
 }

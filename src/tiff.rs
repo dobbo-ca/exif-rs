@@ -110,33 +110,37 @@ fn decode(
         }
         3 => {
             let mut v = budget.vec::<u16>(count)?;
-            v.extend(data.chunks_exact(2).map(|c| rd.u16(c)));
+            v.extend(data.as_chunks::<2>().0.iter().map(|c| rd.u16(c)));
             Value::Short(v)
         }
         8 => {
             let mut v = budget.vec::<i16>(count)?;
             v.extend(
-                data.chunks_exact(2)
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_ne_bytes(rd.u16(c).to_ne_bytes())),
             );
             Value::SShort(v)
         }
         4 | 13 => {
             let mut v = budget.vec::<u32>(count)?;
-            v.extend(data.chunks_exact(4).map(|c| rd.u32(c)));
+            v.extend(data.as_chunks::<4>().0.iter().map(|c| rd.u32(c)));
             Value::Long(v)
         }
         9 => {
             let mut v = budget.vec::<i32>(count)?;
             v.extend(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| i32::from_ne_bytes(rd.u32(c).to_ne_bytes())),
             );
             Value::SLong(v)
         }
         5 => {
             let mut v = budget.vec::<Rational>(count)?;
-            v.extend(data.chunks_exact(8).map(|c| Rational {
+            v.extend(data.as_chunks::<8>().0.iter().map(|c| Rational {
                 num: rd.u32(c),
                 den: rd.u32(at(c, 4)),
             }));
@@ -144,7 +148,7 @@ fn decode(
         }
         10 => {
             let mut v = budget.vec::<SRational>(count)?;
-            v.extend(data.chunks_exact(8).map(|c| SRational {
+            v.extend(data.as_chunks::<8>().0.iter().map(|c| SRational {
                 num: i32::from_ne_bytes(rd.u32(c).to_ne_bytes()),
                 den: i32::from_ne_bytes(rd.u32(at(c, 4)).to_ne_bytes()),
             }));
@@ -152,12 +156,22 @@ fn decode(
         }
         11 => {
             let mut v = budget.vec::<f32>(count)?;
-            v.extend(data.chunks_exact(4).map(|c| f32::from_bits(rd.u32(c))));
+            v.extend(
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_bits(rd.u32(c))),
+            );
             Value::Float(v)
         }
         12 => {
             let mut v = budget.vec::<f64>(count)?;
-            v.extend(data.chunks_exact(8).map(|c| f64::from_bits(rd.u64(c))));
+            v.extend(
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_bits(rd.u64(c))),
+            );
             Value::Double(v)
         }
         _ => return Ok(None),
@@ -228,7 +242,7 @@ impl Walk<'_, '_> {
         let (mut exif_ptr, mut gps_ptr, mut interop_ptr) = (None, None, None);
         let (mut thumb_off, mut thumb_len) = (None, None);
 
-        for e in at(dir, 2).chunks_exact(ENTRY_SIZE).take(n) {
+        for e in at(dir, 2).as_chunks::<ENTRY_SIZE>().0.iter().take(n) {
             let tag = self.rd.u16(e);
             let typ = self.rd.u16(at(e, 2));
             let count = to_usize(self.rd.u32(at(e, 4)));
@@ -343,7 +357,13 @@ pub(crate) fn orientation_value_offset(tiff: &[u8]) -> Option<(usize, ByteOrder)
     let ifd = to_usize(rd.u32(at(body, 4)));
     let dir = body.get(ifd..).filter(|d| ifd >= 8 && d.len() >= 2)?;
     let stated = usize::from(rd.u16(dir));
-    for (k, e) in at(dir, 2).chunks_exact(ENTRY_SIZE).take(stated).enumerate() {
+    for (k, e) in at(dir, 2)
+        .as_chunks::<ENTRY_SIZE>()
+        .0
+        .iter()
+        .take(stated)
+        .enumerate()
+    {
         if rd.u16(e) == TAG_ORIENTATION && rd.u16(at(e, 2)) == 3 && rd.u32(at(e, 4)) == 1 {
             return Some((skip + ifd + 2 + k * ENTRY_SIZE + 8, order));
         }
