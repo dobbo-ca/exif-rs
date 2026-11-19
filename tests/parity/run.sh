@@ -38,6 +38,14 @@ et -EXIF -XMP -ICC_Profile "$work/in" > "$work/exiftool-blocks.json" 2>> "$work/
 "$oracle" read "$work/in" "$work/oracle.jsonl" || { echo "run.sh: oracle read failed" >&2; status=1; }
 python3 "$here/compare.py" "$work/in" "$work/exiftool.json" "$work/exiftool-blocks.json" \
   "$work/oracle.jsonl" "$here/known-differences.tsv" "$report" || status=1
+# The full ExifTool and oracle records of each mismatched file, for diagnosis.
+python3 -c '
+import json, sys
+names = {l.split("\t")[0] for l in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]}
+et = [r for r in json.load(open(sys.argv[2], encoding="utf-8")) if r.get("SourceFile", "").rsplit("/", 1)[-1] in names]
+orc = [json.loads(l) for l in open(sys.argv[3], encoding="utf-8") if json.loads(l).get("SourceFile", "").rsplit("/", 1)[-1] in names]
+json.dump({"exiftool": et, "oracle": orc}, open(sys.argv[4], "w", encoding="utf-8"), indent=1)
+' "$report/read-mismatches.tsv" "$work/exiftool.json" "$work/oracle.jsonl" "$report/mismatch-records.json" || true
 
 for mode in all keep orient1; do
   "$oracle" strip "$mode" "$work/in" "$work/strip/$mode" || { echo "run.sh: oracle strip $mode failed" >&2; status=1; }
