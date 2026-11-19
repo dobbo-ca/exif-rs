@@ -34,9 +34,9 @@ FROM src AS ci
 RUN --mount=type=cache,id=exif-target,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
 RUN --mount=type=cache,id=exif-target,target=/src/target \
-    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets -- -D warnings
 RUN --mount=type=cache,id=exif-target,target=/src/target \
-    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 RUN --mount=type=cache,id=exif-target,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked
 RUN --mount=type=cache,id=exif-target,target=/src/target \

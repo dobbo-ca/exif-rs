@@ -22,7 +22,7 @@ fn exif_with_and_without_prefix() {
     let t = t6();
     let raw = raw_of(&[riff_chunk(b"EXIF", &t)]);
     assert_eq!(raw.container, Container::Webp);
-    assert_eq!(raw.exif, Some(t));
+    assert_eq!(raw.exif.as_deref(), Some(t.as_slice()));
     let prefixed = [b"Exif\0\0".as_slice(), &t].concat();
     assert_eq!(raw_of(&[riff_chunk(b"EXIF", &prefixed)]).exif, Some(t));
 }
