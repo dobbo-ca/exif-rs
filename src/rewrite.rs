@@ -27,7 +27,8 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 ///   the EOI the bytes are copied as they are; bytes after the EOI are dropped.
 /// - PNG: keeps the critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM,
 ///   gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST, pHYs, sPLT, the APNG chunks, iCCP with
-///   `keep.icc`) and drops the rest.
+///   `keep.icc`, and with it the `Raw profile type icc` / `icm` text chunks) and drops the
+///   rest.
 /// - WebP: keeps VP8X, VP8, VP8L, ALPH, ANIM, ANMF and ICCP (with `keep.icc`), fixes the VP8X
 ///   flags and the RIFF size.
 ///
@@ -68,7 +69,9 @@ pub fn strip(
 /// CRC. When there is no orientation the output equals the input. A truncated file is
 /// rewritten as far as it goes.
 ///
-/// Only the first EXIF block and the first XMP packet are changed. Not changed: JPEG extended
+/// Only the first EXIF block and the first XMP packet are changed. A JPEG EXIF block continued
+/// in the APP1 segments right after it is read joined, as [`extract`](crate::extract) gives it,
+/// and the value is written back into the segment that holds it. Not changed: JPEG extended
 /// XMP, a PNG compressed `iTXt` XMP packet, and a PNG ImageMagick raw EXIF profile (`tEXt`,
 /// `zTXt`, `iTXt`); they are copied as they are.
 ///
@@ -78,8 +81,9 @@ pub fn strip(
 /// # Errors
 ///
 /// [`Error::UnknownFormat`]; [`Error::Malformed`] when a changed JPEG APP1 or PNG chunk would
-/// get too long for its length field; [`Error::LimitExceeded`] for `max_alloc`,
-/// `max_segments`, `max_xmp_bytes` and `max_xmp_nodes` (the XMP packet that is scanned);
+/// get too long for its length field, or a WebP chunk size or RIFF size would leave the `u32`
+/// range; [`Error::LimitExceeded`] for `max_alloc`, `max_segments`, `max_exif_bytes` (the
+/// joined JPEG EXIF block), `max_xmp_bytes` and `max_xmp_nodes` (the XMP packet that is scanned);
 /// [`Error::OutOfMemory`]; [`Error::Cancelled`].
 pub fn reset_orientation(
     data: &[u8],
@@ -110,7 +114,8 @@ pub(crate) fn kept_exif(
     let kept =
         parsed.map(|p| p.and_then(|exif| exif.orientation().map(|o| (o, exif.byte_order()))));
     budget.reset_to(mark);
-    budget.release(block.len());
+    // The block was charged by capacity (a joined JPEG block can hold more than its length).
+    budget.release(block.capacity());
     let Some((v, order)) = kept? else {
         return Ok(None);
     };

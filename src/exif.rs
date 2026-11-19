@@ -5,9 +5,9 @@
 //! `SubSecTimeOriginal` loses trailing spaces, the other strings are returned as stored. A
 //! string that is not valid UTF-8 gives `None`. Of two entries with the same tag in one IFD the
 //! accessors read the last one, as ExifTool keeps the last (priority 1); IFD0 Orientation
-//! (priority 0) is the first. The rational accessors take a RATIONAL, an SRATIONAL that is not
-//! negative or an integer (ExifTool reads a number of any type); the integer ones (ISO, pixel
-//! size) any integer type that is not negative.
+//! (priority 0) is the first, and so are the IFD1 thumbnail offset and length. The rational
+//! accessors take a RATIONAL, an SRATIONAL that is not negative or an integer (ExifTool reads a
+//! number of any type); the integer ones (ISO, pixel size) any integer type that is not negative.
 
 use std::sync::atomic::AtomicBool;
 
@@ -334,14 +334,15 @@ impl Exif {
             .map(|e| &e.value)
     }
 
-    /// IFD0 Orientation (0x0112): the first value of the first entry of an integer type (BYTE,
-    /// SHORT, LONG, SBYTE, SSHORT, SLONG), as ExifTool reads it (priority 0: the first entry
-    /// stays). `None` when there is none or the value is not a `u16`.
+    /// IFD0 Orientation (0x0112): the first value of the first entry, as ExifTool reads it
+    /// (priority 0: the first entry stays). `None` when there is none, when that entry is not of
+    /// an integer type (BYTE, SHORT, LONG, SBYTE, SSHORT, SLONG, or IFD read as LONG) or when
+    /// its value is not a `u16`; a later entry is never used.
     pub fn orientation(&self) -> Option<u16> {
         self.entries(IfdKind::Ifd0)
             .iter()
-            .filter(|e| e.tag == 0x0112)
-            .find_map(|e| match &e.value {
+            .find(|e| e.tag == 0x0112)
+            .and_then(|e| match &e.value {
                 Value::Byte(v) => v.first().map(|&x| u16::from(x)),
                 Value::Short(v) => v.first().copied(),
                 Value::Long(v) => v.first().and_then(|&x| u16::try_from(x).ok()),

@@ -1,7 +1,8 @@
 //! The ExifTool parity oracle (docs/parity.md).
 //!
 //! `oracle read <in-dir> <out.jsonl>` writes one JSON object per file of `<in-dir>` (sorted by
-//! name): `{"SourceFile":<name>, <key>:<value>, ...}` with every field exif-rs exposes, keyed and
+//! name): `{"SourceFile":<name>, <key>:<value>, ...}` with the fields of the docs/parity.md table
+//! (not every accessor: `Exif::get`/`entries` and `Xmp::orientation` are not called), keyed and
 //! formatted as `exiftool -j -n -G1 -a -b` prints it, or `{"SourceFile":<name>,"Error":<class>}`.
 //!
 //! `oracle strip <all|keep|orient1> <in-dir> <out-dir>` writes `<out-dir>/<name>` for every file

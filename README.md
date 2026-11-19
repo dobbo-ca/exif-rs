@@ -44,8 +44,9 @@ Details: [docs/limits.md](docs/limits.md).
 | `max_xmp_nodes` | 1 000 000 | XML elements and attributes | `XmpNodes` |
 
 - Each limit returns `Error::LimitExceeded(Limit::...)`.
-- `max_alloc` is the enforced peak: every buffer sized from the input is charged before it is
-  allocated and released when a temporary is dropped.
+- `max_alloc` is the enforced peak, including the zlib inflate of deflate-rs (PNG `zTXt`, `iTXt`,
+  `iCCP`), which runs under the remaining budget: every buffer sized from the input is charged
+  before it is allocated and released when a temporary is dropped.
 - This crate never spawns a thread. `max_threads = 1` and every other value run on the calling
   thread, so a caller's pool is never fought.
 - Set the cancel flag from another thread: the call returns `Error::Cancelled` (checked per IFD,

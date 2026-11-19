@@ -362,8 +362,9 @@ pub(crate) fn parse(
 }
 
 /// The byte range in `tiff` of the first value of IFD0 Orientation (0x0112, the first entry
-/// of an integer type: BYTE, SHORT, LONG, SBYTE, SSHORT or SLONG, inline or out of line), and
-/// the byte order. The range counts a leading `Exif\0\0` when `tiff` has one.
+/// the walk keeps, inline or out of line), and the byte order; `None` when that entry is not of
+/// an integer type (BYTE, SHORT, LONG, SBYTE, SSHORT, SLONG or IFD) or has no value. The range
+/// counts a leading `Exif\0\0` when `tiff` has one.
 pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, ByteOrder)> {
     let (skip, body, order) = header(tiff).ok()?;
     let rd = Rd(order);
@@ -380,14 +381,11 @@ pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, Byte
         if rd.u16(e) != TAG_ORIENTATION {
             continue;
         }
-        let width: usize = match rd.u16(at(e, 2)) {
-            1 | 6 => 1,
-            3 | 8 => 2,
-            4 | 9 => 4,
-            _ => continue,
-        };
+        // The walk skips an entry of an unknown type or whose value does not fit in the block;
+        // so does this. The first entry it keeps is the one ExifTool reports.
+        let typ = rd.u16(at(e, 2));
         let count = to_usize(rd.u32(at(e, 4)));
-        let Some(size) = width.checked_mul(count).filter(|&s| s > 0) else {
+        let Some(size) = type_size(typ).and_then(|ts| ts.checked_mul(count)) else {
             continue;
         };
         let start = if size <= 4 {
@@ -395,9 +393,17 @@ pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, Byte
         } else {
             to_usize(rd.u32(at(e, 8)))
         };
-        // The walk skips an entry whose value does not fit in the block; so does this.
         if start.checked_add(size).is_none_or(|end| end > body.len()) {
             continue;
+        }
+        let width: usize = match typ {
+            1 | 6 => 1,
+            3 | 8 => 2,
+            4 | 9 | 13 => 4,
+            _ => return None,
+        };
+        if size == 0 {
+            return None;
         }
         return Some((skip + start..skip + start + width, order));
     }

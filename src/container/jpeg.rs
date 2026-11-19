@@ -542,18 +542,55 @@ pub(crate) fn strip(
 }
 
 pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec<u8>, Error> {
-    let mut exif: Option<Range<usize>> = None;
+    // The orientation value of the EXIF block as `extract` joins it (with its continuation
+    // segments), set to 1: its range in the block and its new bytes.
+    let mark = budget.used();
+    let fix = extract(data, limits, budget, Want::EXIF)?
+        .exif
+        .and_then(|mut block| {
+            let (r, _) = crate::tiff::orientation_value_range(&block)?;
+            reset_exif_in_place(&mut block);
+            let mut v = [0u8; 4];
+            let src = block.get(r.clone())?;
+            v.get_mut(..src.len())?.copy_from_slice(src);
+            Some((r, v))
+        });
+    budget.reset_to(mark);
+    // The file offset of each byte of the value (at most 4) and its new value.
+    let mut put = [None::<(usize, u8)>; 4];
+    // The block offset where the next continuation segment goes, while the block is open.
+    let mut exif_at: Option<usize> = None;
+    let mut exif_seen = false;
     let mut xmp: Option<(Seg, Range<usize>)> = None;
     let mut xmp_seen = false;
     let mut segs = Segments::new(data, limits, budget);
     while let Item::Seg(s) = segs.step()? {
+        let open = exif_at.take();
         if s.marker != 0xE1 {
             continue;
         }
         let p = s.payload(data);
         if p.starts_with(EXIF_PREFIX) {
-            if exif.is_none() {
-                exif = Some(s.pstart + EXIF_PREFIX.len()..s.end);
+            let at = if exif_seen {
+                open.filter(|_| exif_continuation(p).is_some())
+            } else {
+                exif_seen = true;
+                Some(0)
+            };
+            if let Some(at) = at {
+                let start = s.pstart + EXIF_PREFIX.len();
+                let len = s.end - start;
+                // The block bytes of the value that fall in this segment, mapped to the file.
+                for ((i, &b), slot) in fix
+                    .iter()
+                    .flat_map(|(r, v)| r.clone().zip(v))
+                    .zip(put.iter_mut())
+                {
+                    if let Some(o) = i.checked_sub(at).filter(|&o| o < len) {
+                        *slot = Some((start + o, b));
+                    }
+                }
+                exif_at = at.checked_add(len);
             }
         } else if let Some(b) = p.strip_prefix(XMP_SIG)
             && !xmp_seen
@@ -567,8 +604,10 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
     }
     let mut out = out_vec(budget, data.len())?;
     out.extend_from_slice(data);
-    if let Some(block) = exif.and_then(|r| out.get_mut(r)) {
-        reset_exif_in_place(block);
+    for (at, b) in put.into_iter().flatten() {
+        if let Some(d) = out.get_mut(at) {
+            *d = b;
+        }
     }
     if let Some((s, span)) = xmp {
         let seg_len = (s.end - s.pstart + 2 + 1)

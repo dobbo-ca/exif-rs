@@ -708,3 +708,105 @@ fn output_is_charged_to_max_alloc() {
     };
     assert!(strip(&f, NONE, &l, &no_cancel()).is_ok());
 }
+
+#[test]
+fn orientation_of_type_ifd_is_kept_and_reset() {
+    // ExifTool reads type 13 (IFD) as int32u.
+    let t = tiff(
+        false,
+        &[Ent {
+            tag: 0x0112,
+            typ: 13,
+            count: 1,
+            data: 6u32.to_le_bytes().to_vec(),
+        }],
+    );
+    let f = jpeg(&[app1_exif(&t), dqt()]);
+    assert_eq!(orientation_of(&f), Some(6));
+    assert_eq!(
+        run_strip(&f, ORIENTATION),
+        jpeg(&[app1_exif(&min_exif(false, 6)), dqt()])
+    );
+    let out = run_reset(&f);
+    assert_eq!(orientation_of(&out), Some(1));
+}
+
+#[test]
+fn only_the_first_orientation_entry_counts() {
+    // ExifTool reports the first entry (priority 0). Not an integer: no orientation to keep, and
+    // reset changes nothing (a later SHORT is not the one ExifTool reports).
+    let t = tiff(false, &[ascii(0x0112, "6"), short(false, 0x0112, 3)]);
+    let f = jpeg(&[app1_exif(&t), dqt()]);
+    assert_eq!(orientation_of(&f), None);
+    assert_eq!(run_strip(&f, ORIENTATION), jpeg(&[dqt()]));
+    assert_eq!(run_reset(&f), f);
+    // An integer out of the u16 range: no orientation; reset sets that first entry to 1.
+    let long = Ent {
+        tag: 0x0112,
+        typ: 4,
+        count: 1,
+        data: 70_000u32.to_le_bytes().to_vec(),
+    };
+    let t = tiff(false, &[long, short(false, 0x0112, 5)]);
+    let f = jpeg(&[app1_exif(&t), dqt()]);
+    assert_eq!(orientation_of(&f), None);
+    assert_eq!(run_strip(&f, ORIENTATION), jpeg(&[dqt()]));
+    let out = run_reset(&f);
+    assert_eq!(orientation_of(&out), Some(1));
+    let mut want = f.clone();
+    let at = f.windows(t.len()).position(|w| w == t).unwrap() + ORIENTATION_VALUE_AT;
+    want[at..at + 4].copy_from_slice(&[1, 0, 0, 0]);
+    assert_eq!(out, want);
+}
+
+#[test]
+fn reset_reaches_an_orientation_in_a_continuation_segment() {
+    // The EXIF block split over two APP1 segments (the second `Exif\0\0` with no TIFF header):
+    // IFD0 wholly in the second one; and a BE LONG value split across the two.
+    let long_be = |v: u32| {
+        tiff(
+            true,
+            &[Ent {
+                tag: 0x0112,
+                typ: 4,
+                count: 1,
+                data: v.to_be_bytes().to_vec(),
+            }],
+        )
+    };
+    let cases = [
+        (
+            tiff(false, &[short(false, 0x0112, 6)]),
+            tiff(false, &[short(false, 0x0112, 1)]),
+            8,
+        ),
+        (long_be(6), long_be(1), 20),
+    ];
+    for (t, t1, split) in cases {
+        let file = |b: &[u8]| jpeg(&[app1_exif(&b[..split]), app1_exif(&b[split..]), dqt()]);
+        let f = file(&t);
+        assert_eq!(orientation_of(&f), Some(6));
+        let out = run_reset(&f);
+        assert_eq!(out, file(&t1));
+        assert_eq!(orientation_of(&out), Some(1));
+    }
+}
+
+#[test]
+fn joined_exif_capacity_is_released_before_the_output() {
+    // A 4000-byte EXIF APP1 and a 10-byte continuation: joining doubles the capacity to 8000.
+    // All of it is given back before the output buffer is charged.
+    let mut t = tiff(false, &[short(false, 0x0112, 6)]);
+    t.resize(4000, 0);
+    let more = seg(0xE1, &[b"Exif\0\0".as_slice(), &[1; 10]].concat());
+    let big = seg(0xDB, &[0x11; 60_000]);
+    let f = jpeg(&[app1_exif(&t), more, big.clone()]);
+    let l = Limits {
+        max_alloc: f.len() + 64 + 1000,
+        ..limits()
+    };
+    assert_eq!(
+        strip(&f, ORIENTATION, &l, &no_cancel()),
+        Ok(jpeg(&[app1_exif(&min_exif(false, 6)), big]))
+    );
+}

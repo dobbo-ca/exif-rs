@@ -93,8 +93,9 @@ pub struct Metadata {
 ///
 /// # Errors
 ///
-/// [`Error::UnknownFormat`] when `data` is not JPEG, PNG or WebP; [`Error::Malformed`] when
-/// the container structure is invalid; [`Error::LimitExceeded`] for any [`Limits`] field;
+/// [`Error::UnknownFormat`] when `data` is not JPEG, PNG or WebP (an invalid structure after
+/// the magic bytes ends the walk, it is not an error); [`Error::LimitExceeded`] for any
+/// [`Limits`] field;
 /// [`Error::OutOfMemory`]; [`Error::Cancelled`].
 pub fn read(data: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Metadata, Error> {
     let budget = Budget::new(limits, cancel);
@@ -102,7 +103,19 @@ pub fn read(data: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Metadat
     // A JPEG thumbnail may end past the APP1 segment; like ExifTool, read it from the file.
     let file: &[u8] = match raw.container {
         Container::Jpeg if raw.exif.is_some() => {
+            // A second `Exif\0\0`, which the TIFF header check skips, shifts the file offsets
+            // the same way.
+            let doubled = raw
+                .exif
+                .as_deref()
+                .is_some_and(|b| b.starts_with(container::EXIF_PREFIX));
+            let skip = if doubled {
+                container::EXIF_PREFIX.len()
+            } else {
+                0
+            };
             container::jpeg::exif_start(data, limits, &budget)?
+                .and_then(|start| start.checked_add(skip))
                 .and_then(|start| data.get(start..))
                 .unwrap_or_default()
         }

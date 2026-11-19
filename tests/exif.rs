@@ -480,24 +480,35 @@ fn file_order_and_duplicates_are_kept() {
 }
 
 #[test]
-fn orientation_is_the_first_integer_entry() {
-    // ExifTool reads any integer type (no Format for 0x0112).
+fn orientation_is_the_first_entry() {
+    // ExifTool reads any integer type (no Format for 0x0112), IFD (13) as int32u.
     let data = tiff_ifd0(true, |t| vec![t.long(0x0112, &[6])]);
     assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(6));
     let data = tiff_ifd0(false, |t| vec![t.short(0x0112, &[8])]);
     assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(8));
     let data = tiff_ifd0(true, |t| vec![t.byte(0x0112, &[3])]);
     assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(3));
-    // Not an integer, or out of range: skipped.
     let data = tiff_ifd0(true, |t| {
-        vec![
-            t.ascii(0x0112, "6"),
-            t.long(0x0112, &[70_000]),
-            t.ent(0x0112, 8, 1, (-1i16).to_le_bytes().to_vec()),
-            t.short(0x0112, &[5]),
-        ]
+        vec![t.ent(0x0112, 13, 1, 6u32.to_le_bytes().to_vec())]
     });
-    assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(5));
+    assert_eq!(parse(&data, &lim()).unwrap().orientation(), Some(6));
+    // ExifTool reports the first entry (priority 0): when it is not an integer or out of range
+    // there is no orientation, a later entry is not used.
+    for k in 0u8..3 {
+        let data = tiff_ifd0(true, |t| {
+            let first = match k {
+                0 => t.ascii(0x0112, "6"),
+                1 => t.long(0x0112, &[70_000]),
+                _ => t.ent(0x0112, 8, 1, (-1i16).to_le_bytes().to_vec()),
+            };
+            vec![first, t.short(0x0112, &[5])]
+        });
+        assert_eq!(
+            parse(&data, &lim()).unwrap().orientation(),
+            None,
+            "case {k}"
+        );
+    }
 }
 
 #[test]

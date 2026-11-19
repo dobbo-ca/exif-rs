@@ -387,3 +387,22 @@ fn cancel() {
     flag.store(false, Ordering::Relaxed);
     assert!(extract(&f, &limits(), &flag).is_ok());
 }
+
+#[test]
+fn thumbnail_past_a_doubled_exif_prefix_is_read_at_tiff_offsets() {
+    // APP1 `Exif\0\0Exif\0\0` + TIFF: the header check skips the second prefix, so the file
+    // fallback for a thumbnail past the segment counts from the TIFF header too. IFD1 at 14 has a
+    // 4-byte thumbnail at 48: past the 44-byte block, inside the DQT payload (0x11 bytes).
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 48u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0]);
+    assert_eq!(t.len(), 44);
+    let f = jpeg(&[app1_exif(&[b"Exif\0\0".as_slice(), &t].concat()), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.exif.unwrap().thumbnail(), Some(&[0x11u8; 4][..]));
+}

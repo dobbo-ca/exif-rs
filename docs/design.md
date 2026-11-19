@@ -73,8 +73,8 @@ impl Exif {
     pub fn entries(&self, ifd: IfdKind) -> &[Entry];       // file order, duplicates kept
     pub fn get(&self, ifd: IfdKind, tag: u16) -> Option<&Value>; // first entry with that tag
     // the accessors below read the last entry of a tag (ExifTool keeps the last, priority 1),
-    // except orientation (priority 0: the first)
-    pub fn orientation(&self) -> Option<u16>;              // IFD0 0x0112, first value of the first integer-typed entry
+    // except orientation (priority 0: the first) and thumbnail (the first 0x0201 and 0x0202)
+    pub fn orientation(&self) -> Option<u16>;              // IFD0 0x0112, first value of the first entry; None unless an integer type (IFD as LONG)
     pub fn make(&self) -> Option<&str>;                    // IFD0 0x010F
     pub fn model(&self) -> Option<&str>;                   // IFD0 0x0110
     pub fn lens_make(&self) -> Option<&str>;               // Exif 0xA433
@@ -114,7 +114,7 @@ impl Gps {
 }
 // crate-internal, used by src/rewrite.rs:
 pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, ByteOrder)>; // in src/tiff.rs
-// the bytes of the first value of IFD0 0x0112 (the first entry of an integer type, inline or not)
+// the bytes of the first value of IFD0 0x0112 (the first entry the walk keeps, inline or not; None unless an integer type)
 
 // src/xmp.rs
 pub struct Xmp { /* raw packets and the parsed simple properties */ }
@@ -225,7 +225,9 @@ IFD 0). `Keep.icc` keeps the ICC profile bytes as stored. The image data bytes a
   minimal EXIF chunk is added (at the end), and write the new RIFF size.
 
 `reset_orientation` changes only orientation values to 1, every other byte stays: the first value
-of the EXIF IFD0 Orientation in place, in the width of its type (BYTE, SHORT, LONG or signed;
+of the EXIF IFD0 Orientation in place (the first entry; none when it is not an integer type), in
+the width of its type (BYTE, SHORT, LONG, IFD or signed; a JPEG block continued in the next APP1
+segments is read joined and the value written back to the segment that holds it;
 PNG `eXIf` gets a new CRC), and the text of the first top-level XMP `tiff:Orientation` (the one
 ExifTool reports) replaced by `1` (the JPEG APP1 length, PNG chunk length and CRC, WebP chunk
 size, pad and RIFF size are updated). A chunk none of whose bytes change keeps its CRC as stored.

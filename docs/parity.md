@@ -183,8 +183,9 @@ with the reason:
   `None`. `iso` and `pixel_size` take any integer type that is not negative (Issue 313 ISO is an
   SLONG; `iso` the first value: ExifTool prints `100 200` for two), the strings ASCII (or EXIF
   3.0 UTF-8) that is valid UTF-8, the GPS refs their first byte (`altitude_ref` as a number: an
-  ASCII `"0"` is 48), `orientation` the first value of an integer type. ExifTool reads any type,
-  so such a value is a mismatch (no key on the exif-rs side).
+  ASCII `"0"` is 48), `orientation` the first value of the first entry when it is of an integer
+  type (a later entry is never used, and `reset_orientation` leaves a non-integer one). ExifTool
+  reads any type, so such a value is a mismatch (no key on the exif-rs side).
 - An XMP packet that starts with a UTF-8 BOM and `<?xml ` is parsed. ExifTool's `ProcessXMP`
   takes a BOM followed by `<?xml ` as UTF-16/32 XML and picks the decoding from the BOM bytes,
   where only `\xfe\xff` means big-endian; every other BOM, the UTF-8 one included, gives `'v'`

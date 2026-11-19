@@ -29,8 +29,8 @@ pub enum Limit {
 /// match on the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// The input is not a JPEG, PNG or WebP file (or, for [`Exif::parse`](crate::Exif::parse),
-    /// not a TIFF header).
+    /// The input is not a JPEG, PNG or WebP file. ([`Exif::parse`](crate::Exif::parse) gives
+    /// [`Error::Malformed`] for a block that is not a TIFF header.)
     UnknownFormat,
     /// The input ends inside a structure that the operation needs (for example a JPEG segment
     /// before the first scan, when the call has to rewrite the file).
