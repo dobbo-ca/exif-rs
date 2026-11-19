@@ -1,0 +1,408 @@
+//! JPEG: extract.
+
+mod common;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use common::*;
+use exif::{Container, Error, Limit, Limits, detect, extract};
+
+const GUID_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const GUID_B: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+fn std_xmp_attr(guid: &str) -> Vec<u8> {
+    format!("<x:xmpmeta><rdf:Description xmpNote:HasExtendedXMP=\"{guid}\"/></x:xmpmeta>")
+        .into_bytes()
+}
+
+#[test]
+fn exif_both_byte_orders() {
+    for be in [false, true] {
+        let t = tiff(be, &[short(be, 0x0112, 6)]);
+        let f = jpeg(&[app0_jfif(), app1_exif(&t)]);
+        assert_eq!(detect(&f), Some(Container::Jpeg));
+        let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+        assert_eq!(raw.container, Container::Jpeg);
+        assert_eq!(raw.exif.as_deref(), Some(&t[..]));
+        assert!(raw.xmp.is_none() && raw.xmp_extended.is_none() && raw.icc.is_none());
+    }
+}
+
+#[test]
+fn thumbnail_past_the_app1_segment_is_read_from_the_file() {
+    // IFD0 (no entries) -> IFD1 at 14 with the thumbnail offset 44 and length 4; the block holds
+    // only FF D8 of it, the rest is the start of the next segment (FF DB), as in some Sony and
+    // Sigma files. ExifTool reads the thumbnail from the file.
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 44u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0, 0xFF, 0xD8]);
+    assert_eq!(t.len(), 46);
+    let f = jpeg(&[app0_jfif(), app1_exif(&t), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    let thumb = meta.exif.as_ref().unwrap().thumbnail();
+    assert_eq!(thumb, Some(&[0xFF, 0xD8, 0xFF, 0xDB][..]));
+    // Past the end of the file: no thumbnail; the block alone has none either.
+    let mut end = jpeg(&[app0_jfif(), app1_exif(&t)]);
+    end.truncate(end.len() - SCAN.len() + 1);
+    let meta = exif::read(&end, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.exif.unwrap().thumbnail(), None);
+    let parsed = exif::Exif::parse(&t, &limits(), &no_cancel()).unwrap();
+    assert_eq!(parsed.thumbnail(), None);
+}
+
+#[test]
+fn first_exif_and_first_xmp_win() {
+    let t1 = tiff(false, &[short(false, 0x0112, 1)]);
+    let t2 = tiff(false, &[short(false, 0x0112, 2)]);
+    let f = jpeg(&[
+        app1_exif(&t1),
+        app1_exif(&t2),
+        app1_xmp(b"<one/>"),
+        app1_xmp(b"<two/>"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.exif, Some(t1));
+    assert_eq!(raw.xmp.as_deref(), Some(&b"<one/>"[..]));
+}
+
+#[test]
+fn xmp_standard_packet() {
+    let f = jpeg(&[app1_xmp(xmp_plain().as_bytes())]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp.as_deref(), Some(xmp_plain().as_bytes()));
+    assert!(raw.exif.is_none());
+}
+
+#[test]
+fn icc_chunks_out_of_order() {
+    let f = jpeg(&[
+        app2_icc(2, 3, b"bb"),
+        app2_icc(3, 3, b"cc"),
+        app2_icc(1, 3, b"aa"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aabbcc"[..]));
+}
+
+#[test]
+fn icc_with_a_missing_chunk_is_none() {
+    let f = jpeg(&[app2_icc(1, 3, b"aa"), app2_icc(3, 3, b"cc")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.icc.is_none());
+}
+
+#[test]
+fn extended_xmp_attribute_form_wrong_guid_ignored() {
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 10, 5, b"56789"),
+        app1_ext(GUID_B, 10, 0, b"XXXXXXXXXX"),
+        app1_ext(GUID_A, 10, 0, b"01234"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp_extended.as_deref(), Some(&b"0123456789"[..]));
+}
+
+#[test]
+fn extended_xmp_element_form() {
+    let std = format!(
+        "<x:xmpmeta><rdf:Description><xmpNote:HasExtendedXMP>{GUID_A}</xmpNote:HasExtendedXMP></rdf:Description></x:xmpmeta>"
+    );
+    let f = jpeg(&[app1_xmp(std.as_bytes()), app1_ext(GUID_A, 4, 0, b"abcd")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp_extended.as_deref(), Some(&b"abcd"[..]));
+}
+
+#[test]
+fn extended_xmp_only_wrong_guid_is_none() {
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_B, 4, 0, b"abcd"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+}
+
+#[test]
+fn extended_xmp_without_has_extended_is_none() {
+    let f = jpeg(&[
+        app1_xmp(xmp_plain().as_bytes()),
+        app1_ext(GUID_A, 4, 0, b"abcd"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+}
+
+#[test]
+fn extended_xmp_chunk_past_the_declared_length_is_ignored() {
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 4, 2, b"abcd"),
+        app1_ext(GUID_A, 4, 0, b"wxyz"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp_extended.as_deref(), Some(&b"wxyz"[..]));
+}
+
+#[test]
+fn incomplete_extended_xmp_is_none() {
+    // One chunk of a 200-byte packet: ExifTool warns "Incomplete extended XMP" and reads none.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 200, 0, &[b'x'; 100]),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+    // A gap between chunks: none either.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 10, 0, b"0123"),
+        app1_ext(GUID_A, 10, 6, b"6789"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+    // A later chunk at the same offset replaces the earlier one.
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(GUID_A, 4, 0, b"abcd"),
+        app1_ext(GUID_A, 4, 0, b"wxyz"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.xmp_extended.as_deref(), Some(&b"wxyz"[..]));
+}
+
+#[test]
+fn extended_xmp_guid_is_compared_exactly() {
+    let lower = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let f = jpeg(&[
+        app1_xmp(&std_xmp_attr(GUID_A)),
+        app1_ext(lower, 4, 0, b"abcd"),
+    ]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.xmp_extended.is_none());
+}
+
+#[test]
+fn icc_chunk_numbers_as_exiftool_reads_them() {
+    // A total of 0 (written by some software): the first chunk is the profile.
+    let f = jpeg(&[app2_icc(0, 0, b"aa"), app2_icc(1, 0, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aa"[..]));
+    // Numbered from 0.
+    let f = jpeg(&[app2_icc(1, 2, b"bb"), app2_icc(0, 2, b"aa")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aabb"[..]));
+    // A repeated number is appended and counts toward the total.
+    let f = jpeg(&[app2_icc(1, 2, b"aa"), app2_icc(1, 2, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"aabb"[..]));
+    // Another total before the profile is complete: none.
+    let f = jpeg(&[app2_icc(1, 2, b"aa"), app2_icc(2, 3, b"bb")]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert!(raw.icc.is_none());
+}
+
+#[test]
+fn multi_segment_exif_is_joined() {
+    // IFD0 (no entries) -> IFD1 at 14 with a 4-byte thumbnail at 44; the first APP1 ends at 44,
+    // the thumbnail is in the second APP1 (`Exif\0\0` and no TIFF header), as ExifTool joins it.
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 44u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0]);
+    assert_eq!(t.len(), 44);
+    let thumb = [0xFF, 0xD8, 0xFF, 0xD9];
+    let f = jpeg(&[app1_exif(&t), app1_exif(&thumb), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.raw.exif, Some([&t[..], &thumb[..]].concat()));
+    assert_eq!(meta.exif.unwrap().thumbnail(), Some(&thumb[..]));
+    // Not next to each other: not joined, and the thumbnail is not read across the segments.
+    let f = jpeg(&[app1_exif(&t), dqt(), app1_exif(&thumb)]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.raw.exif, Some(t.clone()));
+    assert_ne!(meta.exif.unwrap().thumbnail(), Some(&thumb[..]));
+}
+
+#[test]
+fn not_a_jpeg() {
+    assert_eq!(
+        extract(b"hello world", &limits(), &no_cancel()),
+        Err(Error::UnknownFormat)
+    );
+    assert_eq!(detect(b"hello world"), None);
+}
+
+#[test]
+fn eoi_without_scan_and_fill_bytes() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let mut f = vec![0xFF, 0xD8, 0xFF, 0xFF];
+    f.extend_from_slice(&app1_exif(&t)[1..]);
+    f.extend_from_slice(&[0xFF, 0xD9]);
+    let raw = extract(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.exif, Some(t));
+}
+
+#[test]
+fn truncated_at_every_length() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let f = jpeg(&[
+        app0_jfif(),
+        app1_exif(&t),
+        app1_xmp(xmp_plain().as_bytes()),
+        app2_icc(1, 1, b"icc"),
+        dqt(),
+    ]);
+    let exif_end = 2 + app0_jfif().len() + app1_exif(&t).len();
+    for n in 0..=f.len() {
+        let r = extract(&f[..n], &limits(), &no_cancel());
+        if n < 3 {
+            assert_eq!(r, Err(Error::UnknownFormat), "n={n}");
+        } else {
+            let raw = r.unwrap();
+            assert_eq!(raw.exif.is_some(), n >= exif_end, "n={n}");
+        }
+    }
+}
+
+#[test]
+fn limit_max_segments() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let f = jpeg(&[app0_jfif(), app1_exif(&t), dqt()]);
+    let l = Limits {
+        max_segments: 2,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::Segments))
+    );
+    let l = Limits {
+        max_segments: 100,
+        ..limits()
+    };
+    assert!(extract(&f, &l, &no_cancel()).is_ok());
+}
+
+#[test]
+fn limit_max_exif_bytes() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let f = jpeg(&[app1_exif(&t)]);
+    let l = Limits {
+        max_exif_bytes: t.len() - 1,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::ExifBytes))
+    );
+    let l = Limits {
+        max_exif_bytes: t.len(),
+        ..limits()
+    };
+    assert!(extract(&f, &l, &no_cancel()).is_ok());
+}
+
+#[test]
+fn limit_max_xmp_bytes() {
+    let std = std_xmp_attr(GUID_A);
+    let f = jpeg(&[app1_xmp(&std)]);
+    let l = Limits {
+        max_xmp_bytes: std.len() - 1,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::XmpBytes))
+    );
+    // Standard and extended packet together.
+    let f = jpeg(&[app1_xmp(&std), app1_ext(GUID_A, 10, 0, b"0123456789")]);
+    let l = Limits {
+        max_xmp_bytes: std.len() + 5,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::XmpBytes))
+    );
+    let l = Limits {
+        max_xmp_bytes: std.len() + 10,
+        ..limits()
+    };
+    assert!(
+        extract(&f, &l, &no_cancel())
+            .unwrap()
+            .xmp_extended
+            .is_some()
+    );
+}
+
+#[test]
+fn limit_max_alloc() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let f = jpeg(&[app1_exif(&t)]);
+    let l = Limits {
+        max_alloc: t.len() - 1,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::Alloc))
+    );
+    let std = std_xmp_attr(GUID_A);
+    let f = jpeg(&[app1_xmp(&std), app1_ext(GUID_A, 1000, 0, &[b'x'; 1000])]);
+    let l = Limits {
+        max_alloc: std.len() + 100,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::Alloc))
+    );
+    let f = jpeg(&[app2_icc(1, 1, &[7; 100])]);
+    let l = Limits {
+        max_alloc: 99,
+        ..limits()
+    };
+    assert_eq!(
+        extract(&f, &l, &no_cancel()),
+        Err(Error::LimitExceeded(Limit::Alloc))
+    );
+}
+
+#[test]
+fn cancel() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    let f = jpeg(&[app1_exif(&t)]);
+    let flag = AtomicBool::new(true);
+    assert_eq!(extract(&f, &limits(), &flag), Err(Error::Cancelled));
+    flag.store(false, Ordering::Relaxed);
+    assert!(extract(&f, &limits(), &flag).is_ok());
+}
+
+#[test]
+fn thumbnail_past_a_doubled_exif_prefix_is_read_at_tiff_offsets() {
+    // APP1 `Exif\0\0Exif\0\0` + TIFF: the header check skips the second prefix, so the file
+    // fallback for a thumbnail past the segment counts from the TIFF header too. IFD1 at 14 has a
+    // 4-byte thumbnail at 48: past the 44-byte block, inside the DQT payload (0x11 bytes).
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 48u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0]);
+    assert_eq!(t.len(), 44);
+    let f = jpeg(&[app1_exif(&[b"Exif\0\0".as_slice(), &t].concat()), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.exif.unwrap().thumbnail(), Some(&[0x11u8; 4][..]));
+}

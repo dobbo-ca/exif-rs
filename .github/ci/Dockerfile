@@ -1,0 +1,157 @@
+# CI image: Rust runs here, on the in-cluster BuildKit, because the ARC runner has no toolchain.
+# The crate depends on one private dobbo-ca port (deflate-rs) by git rev. Its fetch is the only
+# step that needs the GitHub App token, passed as the BuildKit secret `gh_token` (never a build
+# arg, never written to a layer); every later step runs offline. The fuzz crate's own dependencies
+# (libfuzzer-sys from crates.io) are fetched in the same step.
+# Every tool is installed in a stage before `COPY . .`, so a new commit does not install it again,
+# and the fetch runs from the manifests and lockfiles alone, so a commit that leaves them alone
+# does not fetch again.
+FROM rust:1.99.1-bookworm AS toolchain
+RUN rustup component add rustfmt clippy && rustup target add aarch64-unknown-linux-gnu
+WORKDIR /src
+
+# Only the manifests, with empty targets for what they name, so cargo can resolve them.
+FROM toolchain AS deps
+COPY Cargo.toml Cargo.lock ./
+COPY tests/fuzz/Cargo.toml tests/fuzz/Cargo.lock tests/fuzz/
+RUN mkdir -p src tests/fuzz/fuzz_targets && touch src/lib.rs \
+    && for t in exif xmp jpeg png webp read strip; do touch tests/fuzz/fuzz_targets/$t.rs; done
+RUN --mount=type=secret,id=gh_token git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked --manifest-path tests/fuzz/Cargo.toml && git config --global --unset-all url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf \
+    && rm -rf src tests/fuzz/fuzz_targets
+
+FROM toolchain AS src
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+
+# The checks run in the build, so a red check fails the build; a rerun of the same source is a
+# BuildKit cache hit. The target dirs are cache mounts, so they persist across builds. The target
+# cache is shared by every branch and cargo compares mtimes: another branch's newer build would be
+# reused as this one's, so every RUN that runs cargo touches the sources just before it starts,
+# and holds the cache with sharing=locked, so a concurrent build of another commit cannot build
+# into it between the touch and cargo. No SIMD here, so there is no scalar-tier run.
+FROM src AS ci
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets -- -D warnings
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --keep-going --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo build --locked --release --target aarch64-unknown-linux-gnu
+# The fuzz crate (libfuzzer-sys) has to compile; fuzz.yml runs its targets.
+RUN --mount=type=cache,id=exif-fuzz-target,target=/src/tests/fuzz/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cd tests/fuzz && cargo check --locked --bins
+
+# qemu-user and the aarch64 cross toolchain, for the arm64 stages.
+FROM toolchain AS qemu-tools
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+
+FROM qemu-tools AS qemu-arm64
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+
+# The whole suite runs on aarch64 under qemu-user, released: the crate is small and has no SIMD, so
+# there are no kernel-only tests to select (what the target changes is deflate-rs's NEON adler32,
+# which every PNG text inflate runs).
+FROM qemu-arm64 AS arm64
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --release --target aarch64-unknown-linux-gnu
+
+# The ExifTool oracle (perl is in the base image) and the Pillow that tests/parity/compare.py and
+# strip_check.py use. CI-only, installed before `COPY . .`; never a crate dependency.
+FROM toolchain AS oracle-tools
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pil git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ExifTool parity: fetch.sh puts ExifTool 13.64 and the metadata-extractor-images corpus into the
+# shared /corpus cache mount (once per BuildKit cache), run.sh compares examples/oracle.rs against
+# ExifTool over it and writes /report (summary.md, status). The step never fails on a parity
+# difference, so the report is kept; the workflow fails the job when /report/status is not 0 (if
+# run.sh wrote no status, the status of its exit is written here).
+FROM oracle-tools AS parity
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && sh tests/parity/fetch.sh /corpus \
+    && cargo build --locked --release --example oracle \
+    && { sh tests/parity/run.sh /corpus target/release/examples/oracle /report; st=$?; \
+         mkdir -p /report; [ -s /report/status ] || echo $st > /report/status; }
+
+# The report as build output: docker/build-push-action with `outputs: type=local,dest=parity-out`.
+FROM scratch AS parity-report
+COPY --from=parity /report /
+
+# The same oracle example built for x86_64 and for aarch64 (run under qemu-user) reads every 8th
+# input and strips it in all three modes; the outputs must be byte-identical. Outputs are deleted
+# at the end of the RUN, so the layer stays small.
+FROM qemu-tools AS parity-arm64
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && sh tests/parity/fetch.sh /corpus \
+    && mkdir -p /work /out \
+    && sh tests/parity/inputs.sh /corpus /work/in 8 \
+    && echo "$(ls /work/in | wc -l) inputs" \
+    && cargo build --locked --release --example oracle \
+    && cargo build --locked --release --target aarch64-unknown-linux-gnu --example oracle \
+    && x=target/release/examples/oracle && a="qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/release/examples/oracle" \
+    && $x read /work/in /out/x.jsonl && $a read /work/in /out/a.jsonl \
+    && diff /out/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /out/x.jsonl) lines, identical" \
+    && for m in all keep orient1; do \
+         $x strip $m /work/in /out/x-$m && $a strip $m /work/in /out/a-$m \
+         && diff -r /out/x-$m /out/a-$m && diff /out/x-$m.errors /out/a-$m.errors \
+         && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
+       done \
+    && rm -rf /out /work/in
+
+# Fuzzing (fuzz.yml): nightly and cargo-fuzz, with the targets built into the image. The workflow
+# runs it with `docker run`, so a BuildKit cache hit cannot skip the fuzzing. No corpus in the
+# image: the seeds are made by tests/fuzz/make-seeds.sh (printf, no binary fixtures in git).
+FROM toolchain AS fuzz-tools
+RUN rustup toolchain install nightly --profile minimal \
+    && cargo install cargo-fuzz --locked --version 0.13.1
+
+FROM fuzz-tools AS fuzz
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz
+RUN sh tests/fuzz/make-seeds.sh /seeds && find /seeds -type f | wc -l
+
+# Benchmark (bench.yml): ExifTool and the Rust bench example over the same inputs in one image;
+# tests/parity/bench.sh writes /report/bench.md. Information only. The workflow builds it with
+# no-cache-filters: bench so the timing runs every time.
+FROM oracle-tools AS bench
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && sh tests/parity/fetch.sh /corpus \
+    && sh tests/parity/inputs.sh /corpus /work/in \
+    && cargo build --locked --release --example bench \
+    && sh tests/parity/bench.sh /work/in /corpus/exiftool/exiftool target/release/examples/bench /report \
+    && rm -rf /work/in
+
+FROM scratch AS bench-report
+COPY --from=bench /report /

@@ -1,0 +1,10 @@
+exif-rs
+Copyright (c) 2026 Chris Dobbyn. Apache-2.0 licensed (see LICENSE).
+
+This is a new crate, not a port. All code is new. ExifTool (Phil Harvey; GPL or Artistic
+licence, "same terms as Perl itself") is used only in CI as the parity oracle and as a source of
+public sample files; no ExifTool code or tables are copied here. The tag numbers and value types
+come from the EXIF 3.0 (CIPA DC-008), TIFF 6.0 and XMP specifications.
+
+Dependencies: github.com/dobbo-ca/deflate-rs (the owner's own crate, zlib inflate for PNG
+zTXt / compressed iTXt chunks). See docs/dependencies.md.

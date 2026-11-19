@@ -1,0 +1,91 @@
+//! The charge ledger for [`Limits::max_alloc`]: every buffer whose size comes from the input is
+//! charged here before it is allocated, and released when a temporary buffer is dropped.
+
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::{Error, Limit, Limits};
+
+/// One per public call. Not `Sync`: the crate runs on the calling thread only.
+pub(crate) struct Budget<'a> {
+    used: Cell<usize>,
+    max: usize,
+    cancel: &'a AtomicBool,
+}
+
+impl<'a> Budget<'a> {
+    pub(crate) fn new(limits: &Limits, cancel: &'a AtomicBool) -> Self {
+        Self {
+            used: Cell::new(0),
+            max: limits.max_alloc,
+            cancel,
+        }
+    }
+
+    /// Bytes still free under `max_alloc`.
+    pub(crate) fn remaining(&self) -> usize {
+        self.max.saturating_sub(self.used.get())
+    }
+
+    /// Charges `n` bytes, or fails with `LimitExceeded(Alloc)` and charges nothing.
+    pub(crate) fn charge(&self, n: usize) -> Result<(), Error> {
+        let used = self
+            .used
+            .get()
+            .checked_add(n)
+            .filter(|&u| u <= self.max)
+            .ok_or(Error::LimitExceeded(Limit::Alloc))?;
+        self.used.set(used);
+        Ok(())
+    }
+
+    /// Gives back `n` bytes charged before (a temporary buffer that was dropped).
+    pub(crate) fn release(&self, n: usize) {
+        self.used.set(self.used.get().saturating_sub(n));
+    }
+
+    /// The bytes charged now, a mark for [`reset_to`](Self::reset_to).
+    pub(crate) fn used(&self) -> usize {
+        self.used.get()
+    }
+
+    /// Gives back everything charged since `mark` (the buffers charged since then were dropped).
+    pub(crate) fn reset_to(&self, mark: usize) {
+        self.used.set(self.used.get().min(mark));
+    }
+
+    /// An empty `Vec` with room for `n` items, charged first.
+    pub(crate) fn vec<T>(&self, n: usize) -> Result<Vec<T>, Error> {
+        let bytes = n
+            .checked_mul(size_of::<T>())
+            .ok_or(Error::LimitExceeded(Limit::Alloc))?;
+        self.charge(bytes)?;
+        let mut v = Vec::new();
+        if v.try_reserve_exact(n).is_err() {
+            self.release(bytes);
+            return Err(Error::OutOfMemory);
+        }
+        Ok(v)
+    }
+
+    /// A charged copy of `src`.
+    pub(crate) fn copy(&self, src: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut v = self.vec(src.len())?;
+        v.extend_from_slice(src);
+        Ok(v)
+    }
+
+    /// The call's cancel flag, for nested calls (deflate).
+    pub(crate) fn cancel(&self) -> &'a AtomicBool {
+        self.cancel
+    }
+
+    /// `Err(Cancelled)` when the cancel flag is set.
+    pub(crate) fn check_cancel(&self) -> Result<(), Error> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
