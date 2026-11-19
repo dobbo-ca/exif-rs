@@ -1,0 +1,12 @@
+[package]
+name = "exif"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "EXIF and XMP metadata: read, strip and rewrite in JPEG, PNG and WebP. Pure Rust, bounded on hostile input."
+publish = false
+
+[dependencies]
+# zlib inflate for PNG zTXt and compressed iTXt chunks (docs/dependencies.md).
+deflate = { git = "https://github.com/dobbo-ca/deflate-rs", rev = "617a5404b213cee8e0fdc42974e46d65e0a1b480" }
