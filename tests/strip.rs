@@ -810,3 +810,23 @@ fn joined_exif_capacity_is_released_before_the_output() {
         Ok(jpeg(&[app1_exif(&min_exif(false, 6)), big]))
     );
 }
+
+/// Fuzz crash (strip target, run 44498372865): an out-of-line SHORT[9] Orientation whose offset
+/// points into the IFD0 directory. Writing 1 there changed the entry count, so a second reset
+/// changed the file again. The value is now left alone, and reset is idempotent.
+#[test]
+fn reset_orientation_value_inside_ifd0_directory_is_idempotent() {
+    let mut t = b"II*\0\x08\0\0\0\x02\0".to_vec();
+    t.extend_from_slice(&[0x12, 0x01, 3, 0, 9, 0, 0, 0, 14, 0, 0, 0]);
+    t.extend_from_slice(&[0x69, 0x87, 4, 0, 1, 0, 0, 0, 38, 0, 0, 0]);
+    t.extend_from_slice(&[0, 0, 0, 0]);
+    t.extend_from_slice(&[
+        1, 0, 0x27, 0x88, 13, 0, 1, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    let file = jpeg(&[app1_exif(&t), dqt()]);
+    let (l, c) = (limits(), no_cancel());
+    let once = reset_orientation(&file, &l, &c).unwrap();
+    let twice = reset_orientation(&once, &l, &c).unwrap();
+    assert_eq!(once, twice);
+    assert_eq!(once, file);
+}

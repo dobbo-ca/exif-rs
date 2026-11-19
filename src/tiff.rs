@@ -405,6 +405,13 @@ pub(crate) fn orientation_value_range(tiff: &[u8]) -> Option<(Range<usize>, Byte
         if size == 0 {
             return None;
         }
+        // An out-of-line value that overlaps the TIFF header or the IFD0 directory (a hostile
+        // offset) is not written: the write would change the directory itself, so a second reset
+        // would change the file again (found by the strip fuzz target).
+        let dir_end = ifd.saturating_add(2 + stated.saturating_mul(ENTRY_SIZE) + 4);
+        if size > 4 && (start < 8 || (start < dir_end && start + width > ifd)) {
+            return None;
+        }
         return Some((skip + start..skip + start + width, order));
     }
     None
