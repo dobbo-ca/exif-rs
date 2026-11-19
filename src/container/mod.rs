@@ -59,6 +59,8 @@ impl Want {
 
 pub(crate) const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 pub(crate) const EXIF_PREFIX: &[u8] = b"Exif\0\0";
+/// The JPEG APP1 signature of standard XMP (also inside a PNG `Raw profile type APP1`).
+pub(crate) const XMP_SIG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 /// Room for what a rewrite adds (a minimal EXIF block and a VP8X chunk need under 64 bytes).
 const OUT_SLACK: usize = 64;
 

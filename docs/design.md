@@ -83,6 +83,7 @@ impl Exif {
     pub fn gps(&self) -> Option<Gps>;                      // None if the GPS IFD is absent
     pub fn maker_note(&self) -> Option<&[u8]>;             // Exif 0x927C, raw bytes, never parsed
     pub fn thumbnail(&self) -> Option<&[u8]>;              // IFD1 0x0201 offset + 0x0202 length
+    // (from `read` of a JPEG the range may end past the APP1 segment: read from the file)
 }
 pub struct CaptureTime {
     pub date_time: String,            // Exif 0x9003 DateTimeOriginal, ASCII up to the first NUL
@@ -156,15 +157,24 @@ nothing was parsed and the packet does not start with `<` after optional whitesp
   put together by offset, bounded by `max_xmp_bytes`); APP2 `ICC_PROFILE\0` + seq + count are the
   ICC chunks (joined in seq order). A file that ends before SOS still gives what was read.
 - **PNG**: signature, then chunks to IEND (CRC not checked on read). `eXIf` is EXIF (an
-  `Exif\0\0` prefix is removed if present). `iTXt` with keyword `XML:com.adobe.xmp` is XMP
-  (inflate when the compression flag is set). `tEXt` / `zTXt` / `iTXt` with keyword
-  `Raw profile type exif` or `Raw profile type APP1` hold ImageMagick hex text
-  (`\n<name>\n<spaces><decimal length>\n<hex lines>`): decode it; the bytes start with
-  `Exif\0\0`, which is removed. `eXIf` wins over a raw profile. `iCCP` is ICC (inflate). Inflate
-  with `deflate::zlib::decode_limit` under the remaining budget and `max_exif_bytes` /
-  `max_xmp_bytes`.
+  `Exif\0\0` prefix is removed if present). A `tEXt`, `zTXt` or `iTXt` (compression method 0)
+  with keyword `XML:com.adobe.xmp` is XMP, as stored (inflated when compressed; as ExifTool, not
+  only `iTXt`). Text chunks with keyword `Raw profile type <name>` hold ImageMagick hex text
+  (`\n<name>\n<spaces><decimal length>\n<hex lines>`; fewer hex digits than the length: not a
+  profile): `exif` and `APP1` give EXIF when the bytes start with `Exif\0\0` (removed) or a TIFF
+  header, or XMP when they start with the APP1 XMP signature (removed); `xmp` gives XMP; `icc`
+  and `icm` give ICC. The first source of each block wins, except that `eXIf` and `iCCP` win over
+  a raw profile. `iCCP` is ICC (inflate). Inflate with `deflate::zlib::decode_limit` under the
+  remaining budget and `max_exif_bytes` / `max_xmp_bytes`.
 - **WebP**: `RIFF` size `WEBP`, then chunks (FourCC, u32 LE size, data, pad byte when odd).
-  `EXIF` (an `Exif\0\0` prefix is removed), `XMP `, `ICCP`.
+  `EXIF` (an `Exif\0\0` prefix is removed), `XMP ` (or `XMP\0`, which some writers use and
+  ExifTool reads), `ICCP`.
+
+The TIFF header check takes only the byte order (`II` / `MM`) and an IFD0 offset of at least 8:
+a wrong magic number (not 42) is accepted, as ExifTool does (it only warns). `read` of a JPEG
+reads the IFD1 thumbnail from the file when its offset and length end past the APP1 segment
+(some cameras count the segment header in the length; ExifTool reads such a thumbnail from the
+file too); the bytes are bounded by the file and charged to the budget and `max_value_bytes`.
 
 ## Strip and rewrite
 
@@ -179,7 +189,8 @@ IFD 0). `Keep.icc` keeps the ICC profile bytes as stored. The image data bytes a
   (segments between scans included). Bytes after EOI (MPF images, trailers) are dropped. No EOI:
   copy to the end.
 - **PNG**: keep IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST,
-  pHYs, sPLT, acTL, fcTL, fdAT, and iCCP with `keep.icc`, verbatim. Drop all other chunks. The
+  pHYs, sPLT, acTL, fcTL, fdAT, and with `keep.icc` iCCP and the `Raw profile type icc` / `icm`
+  text chunks, verbatim. Drop all other chunks. The
   minimal EXIF goes into a new `eXIf` chunk (CRC computed) right before the first IDAT.
 - **WebP**: keep VP8X, VP8 , VP8L, ALPH, ANIM, ANMF, and ICCP with `keep.icc`. Drop the rest.
   Clear the VP8X flags of what was dropped (EXIF 0x08, XMP 0x04, ICC 0x20), set EXIF when the
@@ -188,4 +199,5 @@ IFD 0). `Keep.icc` keeps the ICC profile bytes as stored. The image data bytes a
 `reset_orientation` changes only orientation values to 1, every other byte stays: the EXIF IFD0
 Orientation value in place (2 bytes; PNG `eXIf` gets a new CRC), and each XMP `tiff:Orientation`
 value text replaced by `1` (the JPEG APP1 length, PNG chunk length and CRC, WebP chunk size, pad
-and RIFF size are updated). No orientation anywhere: the output equals the input.
+and RIFF size are updated). No orientation anywhere: the output equals the input. Not rewritten:
+compressed XMP and the hex text of PNG raw profiles (EXIF or XMP).

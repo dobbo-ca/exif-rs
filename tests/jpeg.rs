@@ -29,6 +29,33 @@ fn exif_both_byte_orders() {
 }
 
 #[test]
+fn thumbnail_past_the_app1_segment_is_read_from_the_file() {
+    // IFD0 (no entries) -> IFD1 at 14 with the thumbnail offset 44 and length 4; the block holds
+    // only FF D8 of it, the rest is the start of the next segment (FF DB), as in some Sony and
+    // Sigma files. ExifTool reads the thumbnail from the file.
+    let mut t = b"II*\0\x08\0\0\0\0\0\x0e\0\0\0\x02\0".to_vec();
+    for (tag, v) in [(0x0201u16, 44u32), (0x0202, 4)] {
+        t.extend(tag.to_le_bytes());
+        t.extend(4u16.to_le_bytes());
+        t.extend(1u32.to_le_bytes());
+        t.extend(v.to_le_bytes());
+    }
+    t.extend([0, 0, 0, 0, 0xFF, 0xD8]);
+    assert_eq!(t.len(), 46);
+    let f = jpeg(&[app0_jfif(), app1_exif(&t), dqt()]);
+    let meta = exif::read(&f, &limits(), &no_cancel()).unwrap();
+    let thumb = meta.exif.as_ref().unwrap().thumbnail();
+    assert_eq!(thumb, Some(&[0xFF, 0xD8, 0xFF, 0xDB][..]));
+    // Past the end of the file: no thumbnail; the block alone has none either.
+    let mut end = jpeg(&[app0_jfif(), app1_exif(&t)]);
+    end.truncate(end.len() - SCAN.len() + 1);
+    let meta = exif::read(&end, &limits(), &no_cancel()).unwrap();
+    assert_eq!(meta.exif.unwrap().thumbnail(), None);
+    let parsed = exif::Exif::parse(&t, &limits(), &no_cancel()).unwrap();
+    assert_eq!(parsed.thumbnail(), None);
+}
+
+#[test]
 fn first_exif_and_first_xmp_win() {
     let t1 = tiff(false, &[short(false, 0x0112, 1)]);
     let t2 = tiff(false, &[short(false, 0x0112, 2)]);

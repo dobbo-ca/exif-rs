@@ -131,6 +131,19 @@ fn jpeg_exif_goes_first_without_jfif() {
 }
 
 #[test]
+fn jpeg_wrong_tiff_magic_is_read_and_kept() {
+    // "MM" then 0x132A instead of 42: ExifTool only warns, and so reads the block.
+    let mut t = min_exif(true, 6);
+    t[2] = 0x13;
+    let f = jpeg(&[app0_jfif(), app1_exif(&t), dqt()]);
+    assert_eq!(orientation_of(&f), Some(6));
+    assert_eq!(
+        run_strip(&f, ORIENTATION),
+        jpeg(&[app0_jfif(), app1_exif(&min_exif(true, 6)), dqt()])
+    );
+}
+
+#[test]
 fn jpeg_no_orientation_keeps_nothing() {
     let t = tiff(false, &[ascii(0x010F, "Canon")]);
     let f = jpeg(&[app1_exif(&t), dqt()]);
@@ -431,6 +444,29 @@ fn png_reset_exif_and_xmp_keep_valid_crcs() {
         );
         assert!(png_chunks(&out).iter().all(|c| c.2));
     }
+}
+
+#[test]
+fn png_reset_xmp_in_text() {
+    let text = |o: &str| {
+        chunk(
+            b"tEXt",
+            format!("XML:com.adobe.xmp\0{}", xmp_attr(o)).as_bytes(),
+        )
+    };
+    let out = run_reset(&png_with(&[text("06")]));
+    assert_eq!(out, png_with(&[text("1")]));
+    assert!(png_chunks(&out).iter().all(|c| c.2));
+}
+
+#[test]
+fn png_keep_icc_keeps_a_raw_icc_profile() {
+    let icc = ztxt_profile("Raw profile type icc", b"profile");
+    let f = png_with(&[icc.clone(), ztxt_profile("Raw profile type xmp", b"<x/>")]);
+    assert_eq!(run_strip(&f, ICC), png_with(&[icc]));
+    assert_eq!(run_strip(&f, NONE), png_with(&[]));
+    let raw = extract(&run_strip(&f, ICC), &limits(), &no_cancel()).unwrap();
+    assert_eq!(raw.icc.as_deref(), Some(&b"profile"[..]));
 }
 
 #[test]

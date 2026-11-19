@@ -99,8 +99,17 @@ pub struct Metadata {
 pub fn read(data: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Metadata, Error> {
     let budget = Budget::new(limits, cancel);
     let raw = container::extract_with(data, limits, &budget)?;
+    // A JPEG thumbnail may end past the APP1 segment; like ExifTool, read it from the file.
+    let file: &[u8] = match raw.container {
+        Container::Jpeg if raw.exif.is_some() => {
+            container::jpeg::exif_start(data, limits, &budget)?
+                .and_then(|start| data.get(start..))
+                .unwrap_or_default()
+        }
+        _ => &[],
+    };
     let exif = match raw.exif.as_deref() {
-        Some(tiff) => soft(Exif::parse_with(tiff, limits, &budget))?,
+        Some(tiff) => soft(Exif::parse_in_file(tiff, file, limits, &budget))?,
         None => None,
     };
     let xmp = match raw.xmp.as_deref() {

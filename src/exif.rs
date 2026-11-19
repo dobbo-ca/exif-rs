@@ -248,7 +248,20 @@ impl Exif {
         limits: &Limits,
         budget: &Budget<'_>,
     ) -> Result<Exif, Error> {
-        crate::tiff::parse(tiff, limits, budget)
+        crate::tiff::parse(tiff, &[], limits, budget)
+    }
+
+    /// [`parse_with`](Self::parse_with) for a block stored in a file: `file` is the file from the
+    /// TIFF header on, or empty (when given, `tiff` has no `Exif\0\0` prefix). Only the IFD1
+    /// thumbnail may be read from it, when its offset and length end past the block (ExifTool
+    /// reads it from the file).
+    pub(crate) fn parse_in_file(
+        tiff: &[u8],
+        file: &[u8],
+        limits: &Limits,
+        budget: &Budget<'_>,
+    ) -> Result<Exif, Error> {
+        crate::tiff::parse(tiff, file, limits, budget)
     }
 
     /// The byte order of the block.
@@ -401,7 +414,8 @@ impl Exif {
 
     /// The thumbnail bytes: IFD1 JPEGInterchangeFormat (0x0201) offset and
     /// JPEGInterchangeFormatLength (0x0202) bytes; `None` when either is missing or the range is
-    /// outside the block.
+    /// outside the block. From [`read`](crate::read) of a JPEG file the range may end past the
+    /// APP1 segment (it is then read from the file, as ExifTool does).
     pub fn thumbnail(&self) -> Option<&[u8]> {
         self.thumbnail.as_deref()
     }

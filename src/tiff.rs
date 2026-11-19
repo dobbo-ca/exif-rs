@@ -62,7 +62,8 @@ impl Rd {
 }
 
 /// Skips an optional `Exif\0\0` prefix and checks the TIFF header. Returns the prefix length, the
-/// bytes from the TIFF header on, and the byte order.
+/// bytes from the TIFF header on, and the byte order. Only the byte order mark is checked: like
+/// ExifTool (which only warns), a wrong magic number (not 42) is accepted.
 fn header(tiff: &[u8]) -> Result<(usize, &[u8], ByteOrder), Error> {
     let skip = if tiff.starts_with(EXIF_PREFIX) {
         EXIF_PREFIX.len()
@@ -70,9 +71,9 @@ fn header(tiff: &[u8]) -> Result<(usize, &[u8], ByteOrder), Error> {
         0
     };
     let body = at(tiff, skip);
-    let order = match body.get(..4) {
-        Some(b"II*\0") => ByteOrder::Little,
-        Some(b"MM\0*") => ByteOrder::Big,
+    let order = match body.get(..2) {
+        Some(b"II") => ByteOrder::Little,
+        Some(b"MM") => ByteOrder::Big,
         _ => return Err(Error::Malformed("tiff header")),
     };
     if body.len() < 8 {
@@ -189,6 +190,8 @@ fn first_uint(value: &Value) -> Option<u32> {
 
 struct Walk<'a, 'b> {
     body: &'a [u8],
+    /// The file from the TIFF header on (empty when unknown), for a thumbnail past the block.
+    file: &'a [u8],
     rd: Rd,
     limits: &'a Limits,
     budget: &'a Budget<'b>,
@@ -282,7 +285,9 @@ impl Walk<'_, '_> {
             && let (Some(o), Some(l)) = (thumb_off, thumb_len)
         {
             let (o, l) = (to_usize(o), to_usize(l));
-            let bytes = o.checked_add(l).and_then(|end| self.body.get(o..end));
+            let bytes = o
+                .checked_add(l)
+                .and_then(|end| self.body.get(o..end).or_else(|| self.file.get(o..end)));
             if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
                 self.add_value_bytes(bytes.len())?;
                 self.thumbnail = Some(self.budget.copy(bytes)?);
@@ -313,7 +318,14 @@ impl Walk<'_, '_> {
 }
 
 /// Parses a TIFF block (with or without a leading `Exif\0\0`).
-pub(crate) fn parse(tiff: &[u8], limits: &Limits, budget: &Budget<'_>) -> Result<Exif, Error> {
+/// `file` is the file from the TIFF header on (empty when unknown): ExifTool reads a thumbnail
+/// that ends past the block from the file.
+pub(crate) fn parse(
+    tiff: &[u8],
+    file: &[u8],
+    limits: &Limits,
+    budget: &Budget<'_>,
+) -> Result<Exif, Error> {
     if tiff.len() > limits.max_exif_bytes {
         return Err(Error::LimitExceeded(Limit::ExifBytes));
     }
@@ -325,6 +337,7 @@ pub(crate) fn parse(tiff: &[u8], limits: &Limits, budget: &Budget<'_>) -> Result
     }
     let mut walk = Walk {
         body,
+        file,
         rd,
         limits,
         budget,

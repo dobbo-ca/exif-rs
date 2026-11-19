@@ -117,7 +117,8 @@ pub(crate) fn extract(
                     Limit::ExifBytes,
                 )?);
             }
-            b"XMP " if want.xmp && raw.xmp.is_none() => {
+            // "XMP\0": written by some software; ExifTool reads it too.
+            b"XMP " | b"XMP\0" if want.xmp && raw.xmp.is_none() => {
                 raw.xmp = Some(capped_copy(
                     budget,
                     d,
@@ -261,7 +262,7 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
     while let Item::Chunk(c) = chunks.step()? {
         if c.kind == *b"EXIF" && exif.is_none() {
             exif = Some(c);
-        } else if c.kind == *b"XMP " && !xmp_seen {
+        } else if (c.kind == *b"XMP " || c.kind == *b"XMP\0") && !xmp_seen {
             xmp_seen = true;
             if let Some(r) = xmp_span(c.data(data), limits) {
                 xmp = Some((c, c.dstart + r.start..c.dstart + r.end));

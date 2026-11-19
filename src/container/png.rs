@@ -3,8 +3,8 @@
 use std::ops::Range;
 
 use super::{
-    Container, EXIF_PREFIX, PNG_SIG, Raw, Walk, Want, be32, capped_copy, exif_body, out_vec,
-    splice_one, xmp_span,
+    Container, EXIF_PREFIX, PNG_SIG, Raw, Walk, Want, XMP_SIG, be32, capped_copy, exif_body,
+    out_vec, splice_one, xmp_span,
 };
 use crate::budget::Budget;
 use crate::crc32::crc32;
@@ -127,8 +127,24 @@ fn itxt(d: &[u8]) -> Option<ITxt<'_>> {
     })
 }
 
-fn is_raw_profile(keyword: &[u8]) -> bool {
-    keyword == b"Raw profile type exif" || keyword == b"Raw profile type APP1"
+/// What an ImageMagick raw profile chunk holds, by its keyword (the ones ExifTool reads).
+#[derive(Clone, Copy)]
+enum Profile {
+    /// `Raw profile type exif` or `APP1`: EXIF (`Exif\0\0` or a TIFF header) or APP1 XMP.
+    App1,
+    /// `Raw profile type xmp`.
+    Xmp,
+    /// `Raw profile type icc` or `icm`.
+    Icc,
+}
+
+fn profile_kind(keyword: &[u8]) -> Option<Profile> {
+    match keyword {
+        b"Raw profile type exif" | b"Raw profile type APP1" => Some(Profile::App1),
+        b"Raw profile type xmp" => Some(Profile::Xmp),
+        b"Raw profile type icc" | b"Raw profile type icm" => Some(Profile::Icc),
+        _ => None,
+    }
 }
 
 /// Inflates a zlib stream under the remaining budget and `cap`. `None` when the stream is
@@ -171,9 +187,15 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Decodes ImageMagick raw profile text (`\n<name>\n<spaces><decimal length>\n<hex lines>`)
-/// into an EXIF block without `Exif\0\0`. `None` when the text is not one.
-fn raw_profile(text: &[u8], limits: &Limits, budget: &Budget) -> Result<Option<Vec<u8>>, Error> {
+/// Decodes ImageMagick raw profile text (`\n<name>\n<spaces><decimal length>\n<hex lines>`).
+/// `None` when the text is not one (or holds fewer hex digits than the length says). A length
+/// over `cap` is `LimitExceeded(cap_limit)`.
+fn raw_profile(
+    text: &[u8],
+    cap: usize,
+    cap_limit: Limit,
+    budget: &Budget,
+) -> Result<Option<Vec<u8>>, Error> {
     let mut i = 0;
     while text.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
@@ -197,8 +219,11 @@ fn raw_profile(text: &[u8], limits: &Limits, budget: &Budget) -> Result<Option<V
     if !digits || n == 0 {
         return Ok(None);
     }
-    if n > limits.max_exif_bytes {
-        return Err(Error::LimitExceeded(Limit::ExifBytes));
+    if n > cap {
+        return Err(Error::LimitExceeded(cap_limit));
+    }
+    if n > text.len().saturating_sub(i) / 2 {
+        return Ok(None);
     }
     let mut out = budget.vec::<u8>(n)?;
     let mut hi: Option<u8> = None;
@@ -217,34 +242,48 @@ fn raw_profile(text: &[u8], limits: &Limits, budget: &Budget) -> Result<Option<V
             }
         }
     }
-    let tiff = out.starts_with(b"II*\0") || out.starts_with(b"MM\0*");
-    if out.len() != n || !(tiff || out.starts_with(EXIF_PREFIX)) {
+    if out.len() != n {
         budget.release(n);
         return Ok(None);
-    }
-    if out.starts_with(EXIF_PREFIX) {
-        out.drain(..EXIF_PREFIX.len()).for_each(drop);
     }
     Ok(Some(out))
 }
 
-/// The EXIF block of a raw profile chunk whose text is `body` (inflated when `compressed`).
+/// The bytes of a raw profile chunk whose text is `body` (inflated when `compressed`).
 fn profile_from(
     body: &[u8],
     compressed: bool,
-    limits: &Limits,
+    cap: usize,
+    cap_limit: Limit,
     budget: &Budget,
 ) -> Result<Option<Vec<u8>>, Error> {
     if !compressed {
-        return raw_profile(body, limits, budget);
+        return raw_profile(body, cap, cap_limit, budget);
     }
-    let cap = limits.max_exif_bytes.saturating_mul(2).saturating_add(1024);
-    let Some(text) = inflate(body, cap, Limit::ExifBytes, budget)? else {
+    let text_cap = cap.saturating_mul(2).saturating_add(1024);
+    let Some(text) = inflate(body, text_cap, cap_limit, budget)? else {
         return Ok(None);
     };
-    let r = raw_profile(&text, limits, budget);
+    let r = raw_profile(&text, cap, cap_limit, budget);
     budget.release(text.len());
     r
+}
+
+/// A text chunk (`tEXt`, `zTXt`, or `iTXt` with compression method 0): the keyword, the text,
+/// and whether the text is zlib data.
+fn text_chunk<'a>(kind: &[u8; 4], d: &'a [u8]) -> Option<(&'a [u8], &'a [u8], bool)> {
+    match kind {
+        b"tEXt" => split_nul(d).map(|(k, t)| (k, t, false)),
+        b"zTXt" => match split_nul(d)? {
+            (k, [0, z @ ..]) => Some((k, z, true)),
+            _ => None,
+        },
+        b"iTXt" => {
+            let t = itxt(d).filter(|t| !t.compressed || t.method == 0)?;
+            Some((t.keyword, d.get(t.text_start..)?, t.compressed))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn extract(
@@ -260,7 +299,7 @@ pub(crate) fn extract(
         xmp_extended: None,
         icc: None,
     };
-    let mut exif_chunk = false;
+    let (mut exif_chunk, mut iccp_chunk) = (false, false);
     let mut chunks = Chunks::new(data, limits, budget);
     while let Item::Chunk(c) = chunks.step()? {
         let d = c.data(data);
@@ -277,58 +316,94 @@ pub(crate) fn extract(
                 }
                 exif_chunk = true;
             }
-            b"iCCP" if want.icc && raw.icc.is_none() => {
+            b"iCCP" if want.icc && !iccp_chunk => {
                 let Some((_name, r)) = split_nul(d) else {
                     continue;
                 };
                 let [0, z @ ..] = r else { continue };
-                raw.icc = inflate(z, usize::MAX, Limit::Alloc, budget)?;
-            }
-            b"iTXt" => {
-                let Some(t) = itxt(d) else { continue };
-                let body = d.get(t.text_start..).unwrap_or_default();
-                if t.keyword == XMP_KEYWORD {
-                    if !want.xmp || raw.xmp.is_some() {
-                        continue;
+                if let Some(v) = inflate(z, usize::MAX, Limit::Alloc, budget)? {
+                    if let Some(old) = raw.icc.replace(v) {
+                        budget.release(old.len());
                     }
-                    raw.xmp = if !t.compressed {
-                        Some(capped_copy(
-                            budget,
-                            body,
-                            limits.max_xmp_bytes,
-                            Limit::XmpBytes,
-                        )?)
-                    } else if t.method == 0 {
-                        inflate(body, limits.max_xmp_bytes, Limit::XmpBytes, budget)?
-                    } else {
-                        None
-                    };
-                } else if is_raw_profile(t.keyword)
-                    && want.exif
-                    && raw.exif.is_none()
-                    && (!t.compressed || t.method == 0)
-                {
-                    raw.exif = profile_from(body, t.compressed, limits, budget)?;
+                    iccp_chunk = true;
                 }
             }
-            b"tEXt" if want.exif && raw.exif.is_none() => {
-                if let Some((keyword, body)) = split_nul(d)
-                    && is_raw_profile(keyword)
-                {
-                    raw.exif = profile_from(body, false, limits, budget)?;
+            kind => {
+                let Some((keyword, body, compressed)) = text_chunk(kind, d) else {
+                    continue;
+                };
+                if keyword == XMP_KEYWORD {
+                    if want.xmp && raw.xmp.is_none() {
+                        raw.xmp = if compressed {
+                            inflate(body, limits.max_xmp_bytes, Limit::XmpBytes, budget)?
+                        } else {
+                            Some(capped_copy(
+                                budget,
+                                body,
+                                limits.max_xmp_bytes,
+                                Limit::XmpBytes,
+                            )?)
+                        };
+                    }
+                } else if let Some(p) = profile_kind(keyword) {
+                    profile_into(&mut raw, p, body, compressed, limits, budget, want)?;
                 }
             }
-            b"zTXt" if want.exif && raw.exif.is_none() => {
-                if let Some((keyword, [0, z @ ..])) = split_nul(d)
-                    && is_raw_profile(keyword)
-                {
-                    raw.exif = profile_from(z, true, limits, budget)?;
-                }
-            }
-            _ => {}
         }
     }
     Ok(raw)
+}
+
+/// Decodes a raw profile chunk into the empty slot of `raw` it belongs to (the first one
+/// wins; `eXIf` and `iCCP` replace it later).
+fn profile_into(
+    raw: &mut Raw,
+    p: Profile,
+    body: &[u8],
+    compressed: bool,
+    limits: &Limits,
+    budget: &Budget,
+    want: Want,
+) -> Result<(), Error> {
+    let exif_free = want.exif && raw.exif.is_none();
+    let xmp_free = want.xmp && raw.xmp.is_none();
+    let (free, cap, cap_limit) = match p {
+        Profile::App1 => (
+            exif_free || xmp_free,
+            limits.max_exif_bytes,
+            Limit::ExifBytes,
+        ),
+        Profile::Xmp => (xmp_free, limits.max_xmp_bytes, Limit::XmpBytes),
+        Profile::Icc => (want.icc && raw.icc.is_none(), usize::MAX, Limit::Alloc),
+    };
+    if !free {
+        return Ok(());
+    }
+    let Some(mut v) = profile_from(body, compressed, cap, cap_limit, budget)? else {
+        return Ok(());
+    };
+    match p {
+        Profile::Xmp => raw.xmp = Some(v),
+        Profile::Icc => raw.icc = Some(v),
+        Profile::App1 => {
+            let n = v.len();
+            if exif_free && v.starts_with(EXIF_PREFIX) {
+                v.drain(..EXIF_PREFIX.len()).for_each(drop);
+                raw.exif = Some(v);
+            } else if exif_free && (v.starts_with(b"II*\0") || v.starts_with(b"MM\0*")) {
+                raw.exif = Some(v);
+            } else if xmp_free && v.starts_with(XMP_SIG) {
+                if n - XMP_SIG.len() > limits.max_xmp_bytes {
+                    return Err(Error::LimitExceeded(Limit::XmpBytes));
+                }
+                v.drain(..XMP_SIG.len()).for_each(drop);
+                raw.xmp = Some(v);
+            } else {
+                budget.release(n);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn put_exif(out: &mut Vec<u8>, pending: &mut Option<[u8; MIN_EXIF_LEN]>) {
@@ -340,12 +415,18 @@ fn put_exif(out: &mut Vec<u8>, pending: &mut Option<[u8; MIN_EXIF_LEN]>) {
     }
 }
 
-fn keep_chunk(kind: &[u8; 4], keep: Keep) -> bool {
+fn keep_chunk(kind: &[u8; 4], d: &[u8], keep: Keep) -> bool {
     match kind {
         b"IHDR" | b"PLTE" | b"IDAT" | b"IEND" | b"tRNS" | b"cHRM" | b"gAMA" | b"sBIT" | b"sRGB"
         | b"cICP" | b"mDCV" | b"cLLI" | b"bKGD" | b"hIST" | b"pHYs" | b"sPLT" | b"acTL"
         | b"fcTL" | b"fdAT" => true,
         b"iCCP" => keep.icc,
+        // An ICC profile stored as ImageMagick raw profile text.
+        b"tEXt" | b"zTXt" | b"iTXt" => {
+            keep.icc
+                && text_chunk(kind, d)
+                    .is_some_and(|(k, _, _)| matches!(profile_kind(k), Some(Profile::Icc)))
+        }
         _ => false,
     }
 }
@@ -374,7 +455,7 @@ pub(crate) fn strip(
                 if c.kind == *b"IDAT" || c.kind == *b"IEND" {
                     put_exif(&mut out, &mut pending);
                 }
-                if keep_chunk(&c.kind, keep) {
+                if keep_chunk(&c.kind, c.data(data), keep) {
                     out.extend_from_slice(data.get(c.start..c.end).unwrap_or_default());
                 }
             }
@@ -404,15 +485,14 @@ pub(crate) fn reset(data: &[u8], limits: &Limits, budget: &Budget) -> Result<Vec
     while let Item::Chunk(c) = chunks.step()? {
         if c.kind == *b"eXIf" && exif.is_none() {
             exif = Some(c);
-        } else if c.kind == *b"iTXt"
-            && !xmp_seen
-            && let Some(t) = itxt(c.data(data))
-            && t.keyword == XMP_KEYWORD
+        } else if !xmp_seen
+            && let Some((keyword, text, compressed)) = text_chunk(&c.kind, c.data(data))
+            && keyword == XMP_KEYWORD
         {
             xmp_seen = true;
-            if !t.compressed {
-                let base = c.dstart + t.text_start;
-                let text = data.get(base..c.dend).unwrap_or_default();
+            if !compressed {
+                // The text runs to the end of the chunk data.
+                let base = c.dend - text.len();
                 if let Some(r) = xmp_span(text, limits) {
                     xmp = Some((c, base + r.start..base + r.end));
                 }

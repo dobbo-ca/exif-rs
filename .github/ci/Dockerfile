@@ -115,7 +115,7 @@ RUN --mount=type=cache,id=exif-target,target=/src/target \
     && diff /out/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /out/x.jsonl) lines, identical" \
     && for m in all keep orient1; do \
          $x strip $m /work/in /out/x-$m && $a strip $m /work/in /out/a-$m \
-         && cmp -r /out/x-$m /out/a-$m && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
+         && diff -r /out/x-$m /out/a-$m && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
        done \
     && rm -rf /out /work/in
 

@@ -183,7 +183,9 @@ fn fields(meta: &Metadata) -> Vec<(String, Val<'_>)> {
     // ExifTool makes the EXIF tag only for a block of more than 16 bytes.
     let raw = &meta.raw;
     if let Some(b) = raw.exif.as_deref().filter(|b| b.len() > 16) {
-        f.push(("EXIF:EXIF".into(), Val::Binary(b)));
+        let v = kodak_patch(meta.exif.as_ref(), b)
+            .map_or(Val::Binary(b), |p| Val::Text(convert_binary(&p)));
+        f.push(("EXIF:EXIF".into(), v));
     }
     if let Some(b) = raw.xmp.as_deref() {
         f.push(("XMP:XMP".into(), Val::Binary(b)));
@@ -192,6 +194,31 @@ fn fields(meta: &Metadata) -> Vec<(String, Val<'_>)> {
         f.push(("ICC_Profile:ICC_Profile".into(), Val::Binary(b)));
     }
     f
+}
+
+/// The EXIF block as ExifTool prints it after its maker note handling changed it in place:
+/// MakerNoteKodak8b (Make has `Kodak`, note `MM\0*\0\0\0\x08\0?\0\0`) and MakerNoteKodak11 (Make
+/// without `Kodak`, which MakerNoteKodak8c would take, Model has `Kodak` or `PixPro`, note
+/// `II*\0\x08\0\0\0?\0\0\0`) go through ExifTool's `ProcessKodakPatch`, which writes the 2-byte
+/// entry count at note offset 10 (a copy of bytes 8..10 for these headers). `None`: unchanged.
+fn kodak_patch(ex: Option<&Exif>, block: &[u8]) -> Option<Vec<u8>> {
+    let ex = ex?;
+    let note = ex.maker_note()?;
+    let kodak = ex.make()?.to_ascii_lowercase().contains("kodak");
+    let model = ex.model().unwrap_or_default().to_ascii_lowercase();
+    let k8b =
+        kodak && note.starts_with(b"MM\0*\0\0\0\x08\0") && note.get(10..12) == Some(&[0u8, 0][..]);
+    let k11 = !kodak
+        && (model.contains("kodak") || model.contains("pixpro"))
+        && note.starts_with(b"II*\0\x08\0\0\0")
+        && note.get(9..12) == Some(&[0u8, 0, 0][..]);
+    if !(k8b || k11) {
+        return None;
+    }
+    let at = block.windows(note.len()).position(|w| w == note)?;
+    let mut out = block.to_vec();
+    out.copy_within(at + 8..at + 10, at + 10);
+    Some(out)
 }
 
 fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
@@ -257,21 +284,19 @@ fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
     });
 
     if let Some(gps) = ex.gps() {
-        if lat.is_some() && lat_ref.is_some() {
-            put(
-                f,
-                "Composite:GPSLatitude",
-                composite_deg(gps.latitude_deg()),
-            );
+        // The Gps API value when it has one (RATIONAL coordinates); else ExifTool's ValueConv on
+        // the GPS texts (any type, and '' from ToDegrees for inf/undef parts).
+        if let (Some(l), Some(r)) = (&lat, &lat_ref) {
+            let v =
+                composite_deg(gps.latitude_deg()).unwrap_or_else(|| composite_coord(l, r, b'S'));
+            put(f, "Composite:GPSLatitude", Some(v));
         }
-        if lon.is_some() && lon_ref.is_some() {
-            put(
-                f,
-                "Composite:GPSLongitude",
-                composite_deg(gps.longitude_deg()),
-            );
+        if let (Some(l), Some(r)) = (&lon, &lon_ref) {
+            let v =
+                composite_deg(gps.longitude_deg()).unwrap_or_else(|| composite_coord(l, r, b'W'));
+            put(f, "Composite:GPSLongitude", Some(v));
         }
-        if alt.is_some() && alt_ref.is_some() {
+        if let (Some(a), Some(r)) = (&alt, &alt_ref) {
             // ExifTool returns GPSAltitude's own %.10g text when the ref is 0, else the number
             // -abs(value), which Perl prints with %.15g.
             let text = |a: f64| {
@@ -281,8 +306,12 @@ fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
                     fmt_g(a, 10)
                 }
             };
-            let a = gps.altitude_m().filter(|a| a.is_finite());
-            put(f, "Composite:GPSAltitude", a.map(|a| text(a).into_bytes()));
+            let v = gps
+                .altitude_m()
+                .filter(|a| a.is_finite())
+                .map(|a| text(a).into_bytes())
+                .or_else(|| composite_altitude(a, r));
+            put(f, "Composite:GPSAltitude", v);
         }
     }
     if let (Some(d), Some(t)) = (&date, &time) {
@@ -316,6 +345,60 @@ fn exif_fields<'a>(ex: &'a Exif, f: &mut Vec<(String, Val<'a>)>) {
 /// A Composite GPS coordinate: a Perl number.
 fn composite_deg(d: Option<f64>) -> Option<Vec<u8>> {
     d.filter(|d| d.is_finite()).map(|d| perl_nv(d).into_bytes())
+}
+
+/// ExifTool's Composite GPSLatitude/GPSLongitude ValueConv on the GPS texts:
+/// `$ref =~ /^S/i ? -$deg : $deg` (`W` for longitude). Perl's `-''` and `-"0"` are `0`.
+fn composite_coord(deg: &[u8], r: &[u8], neg: u8) -> Vec<u8> {
+    if r.first().is_some_and(|c| c.eq_ignore_ascii_case(&neg)) {
+        perl_nv(-perl_num(deg)).into_bytes()
+    } else {
+        deg.to_vec()
+    }
+}
+
+/// ExifTool's Composite GPSAltitude ValueConv on the GPS texts: only for a float text
+/// (`IsFloat`); a true ref (not `''` or `"0"`) gives `-abs(value)`, else the text itself.
+fn composite_altitude(alt: &[u8], r: &[u8]) -> Option<Vec<u8>> {
+    if !is_float(alt) {
+        return None;
+    }
+    Some(if r.is_empty() || r == b"0" {
+        alt.to_vec()
+    } else {
+        perl_nv(-perl_num(alt).abs()).into_bytes()
+    })
+}
+
+/// ExifTool's `IsFloat`: `^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee][+-]\d+)?$`.
+fn is_float(s: &[u8]) -> bool {
+    let s = s.strip_suffix(b"\n").unwrap_or(s);
+    let s = s
+        .strip_prefix(b"+")
+        .or_else(|| s.strip_prefix(b"-"))
+        .unwrap_or(s);
+    let digits = |i: usize| {
+        s.get(i..)
+            .map_or(0, |t| t.iter().take_while(|c| c.is_ascii_digit()).count())
+    };
+    let int = digits(0);
+    let mut i = int;
+    let mut frac = 0;
+    if s.get(i) == Some(&b'.') {
+        frac = digits(i + 1);
+        i += 1 + frac;
+    }
+    if int == 0 && frac == 0 {
+        return false;
+    }
+    if matches!(s.get(i), Some(b'e' | b'E')) && matches!(s.get(i + 1), Some(b'+' | b'-')) {
+        let exp = digits(i + 2);
+        if exp == 0 {
+            return false;
+        }
+        i += 2 + exp;
+    }
+    i == s.len()
 }
 
 /// The values of one XMP property, in document order.

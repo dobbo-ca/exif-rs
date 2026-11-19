@@ -99,15 +99,26 @@ Value conversion (ExifTool.pm `ReadValue`, Exif.pm, GPS.pm, XMP.pm):
   removed; `%.2d:%.2d:<s>`. A part that is not a finite number is not reproduced (no key).
 - GPSDateStamp has `Format => 'undef'`: the stored bytes whatever the type, `s/\0+$//`, then
   `Exif::ExifDate`: `s/(\d{4})[^\d]*(\d{2})[^\d]*(\d{2})$/$1:$2:$3/`.
-- Composite:GPSLatitude/GPSLongitude need GPS:GPSLatitude and the ref; the value is a Perl number.
-  Composite:GPSAltitude needs the altitude and its ref; with ref 0 it is the GPS:GPSAltitude text
-  (`%.10g`), else `-abs(value)` printed as a Perl number. Composite:GPSDateTime is
-  `"$date $time" . "Z"` of the two converted GPS keys.
+- Composite:GPSLatitude/GPSLongitude (`Require` GPS:GPSLatitude and its ref): `Gps::latitude_deg`
+  as a Perl number when it has a value; else (a coordinate that is not RATIONAL, or has an
+  `inf`/`undef` part) ExifTool's ValueConv on the texts, `$ref =~ /^S/i ? -$deg : $deg` (`W` for
+  longitude), where `$deg` is the GPS:GPSLatitude text: `''` from ToDegrees stays `''` (printed
+  as a string), and Perl's `-''` and `-"0"` are `0`.
+- Composite:GPSAltitude (`Desire` the altitude and its ref, needs the ref): `Gps::altitude_m`
+  when it has a value, with ref 0 the GPS:GPSAltitude text (`%.10g`), else `-abs(value)` printed
+  as a Perl number; else ExifTool's ValueConv on the texts: only when the altitude text is
+  `IsFloat` (`^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee][+-]\d+)?$`), a true ref (not `''` or `0`) gives
+  `-abs`, else the text. The XMP GPSAltitude fallback of the same Composite is not reproduced.
+  Composite:GPSDateTime is `"$date $time" . "Z"` of the two converted GPS keys.
 - Composite:SubSecDateTimeOriginal (raw values): when SubSecTimeOriginal starts with digits,
   `.<digits>` goes after the first ` hh:mm:ss` not already followed by `.digit` (no such time: no
   sub-seconds); when OffsetTimeOriginal matches `^([-+])(\d{1,2}):(\d{2})` and the date has no
   `-` or `+`, `sprintf('%s%.2d:%.2d')` is appended. Neither: no key.
-- ThumbnailImage is a Composite with the IFD1 group, built when the length is not 0.
+- ThumbnailImage is a Composite with the IFD1 group, built when the length is not 0. When the
+  offset and length end past the EXIF block, ExifTool (`ExtractImage`) reads the bytes from the
+  file; exif-rs `read` does the same for JPEG (Sony DCR-PC110, Sigma DP2 Quattro: the length
+  runs 1-2 bytes into the next segment).
+- A TIFF header with a wrong magic number (not 42) is read; ExifTool only warns.
 - XMP: `tiff:Orientation` and `xmp:Rating` are the text. `xmp:CreateDate` (a `date`) goes through
   `ConvertXMPDate`: `^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}:\d{2})(:\d{2})?\s*(\S*)$` becomes
   `$1:$2:$3 $4$5$6`, else a value starting with four digits has every `-` changed to `:`.
@@ -116,7 +127,16 @@ Value conversion (ExifTool.pm `ReadValue`, Exif.pm, GPS.pm, XMP.pm):
   `HDRCapacityMax` are single values. An unknown hdrgm property gets the name with its first
   letter upper-cased and XMPAutoConv (`n/d` to the quotient, `inf`, `undef`; else the full
   date-time form of `ConvertXMPDate`), and is a list when it repeats.
-- The EXIF block tag exists only for a block of more than 16 bytes.
+- The EXIF block tag exists only for a block of more than 16 bytes. ExifTool processes maker
+  notes in place in the block it later prints, and `MakerNotes::ProcessKodakPatch` writes the
+  2-byte IFD entry count at note offset 10: for MakerNoteKodak8b (Make has `Kodak`, note
+  `MM\0*\0\0\0\x08\0?\0\0`) and MakerNoteKodak11 (Make without `Kodak`, Model has `Kodak` or
+  `PixPro`, note `II*\0\x08\0\0\0?\0\0\0`) that is a copy of note bytes 8-9 to 10-11. The oracle
+  applies it to EXIF:EXIF (Kodak PIXPRO AZ521, SP360).
+- PNG XMP and ICC (`Metadata::raw`) also come from `tEXt`/`zTXt` `XML:com.adobe.xmp` and
+  ImageMagick `Raw profile type xmp`/`APP1`/`icc`/`icm` chunks; WebP XMP also from `XMP\0`
+  (docs/design.md, Containers). XMP:XMP is the packet as stored, so a packet that is not UTF-8
+  prints as base64.
 
 Duplicates (ExifTool.pm `FoundTag`, the `exiftool` JSON writer): with `-j` one key is printed per
 group and name, the priority one. A later tag of priority 1 replaces an earlier one, a priority-0
@@ -143,9 +163,9 @@ JSON writing (the `exiftool` script, `EscapeJSON` and `ConvertBinary`):
 These follow the exif-rs API on purpose; a mismatch they cause goes in `known-differences.tsv`
 with the reason:
 
-- `Gps::latitude_deg`/`longitude_deg` need RATIONAL[3]; ExifTool reads any type. A coordinate
-  with `inf`/`undef` has no Composite here; ExifTool prints `''` or `0`.
-- `Gps::altitude_m` needs a RATIONAL.
+- `Gps::latitude_deg`/`longitude_deg` need RATIONAL[3] and finite parts, `Gps::altitude_m` a
+  RATIONAL; ExifTool reads any type and prints `''` or `0` for `inf`/`undef`. The oracle then
+  uses ExifTool's rule on the texts (above), so those files do not test these accessors.
 - `Exif::capture_time` reads the Exif IFD only; ExifTool's Composite also takes an IFD0
   DateTimeOriginal.
 - exif-rs reads the first EXIF block and XMP packet of a file; ExifTool reads all of them.
@@ -168,13 +188,16 @@ is checked; the files exif-rs refused are counted by error class (`<mode>.errors
   ICC*, PNG text, ...) is a failure.
 - **keep** (`strip(Keep { orientation: true, icc: true })`): as `all`, plus `IFD0:Orientation`
   equal to the original's (absent when the original has none), `File:ExifByteOrder` only with
-  it, and every `ICC*` key (and `PNG:ProfileName`) equal to the original's, none added or lost.
+  it, and every `ICC*` key (and `PNG:ProfileName`, and `PNG:ICC_Profile`, ExifTool's tag for an
+  ICC chunk it cannot decode) equal to the original's, none added or lost.
 - **orient1** (`reset_orientation`): every key equal to the original's except the `System`
   group (file name, size, dates) and `IFD0:Orientation` and `XMP-tiff:Orientation`, which are
   `1` when the original has them and absent when it does not.
 
 Pixel check (all modes): Pillow decodes the original and the output (`Image.open`, then for every
-frame `seek`, `load`, and mode, size and a SHA-256 of `tobytes()`); they must be equal. An
+frame `seek`, `load`, and mode, size and a SHA-256 of `tobytes()`); they must be equal. For JPEG
+only the first frame counts: Pillow opens a JPEG with an MPF segment as MPO, whose other frames
+are the images after EOI, which strip drops by design. An
 original that Pillow cannot decode (truncated, hostile, decompression bomb) is skipped and
 counted by exception class. An output that Pillow cannot decode while its original decodes is a
 failure.

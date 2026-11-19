@@ -56,7 +56,9 @@ def allowed(key):
 
 
 def is_icc(key):
-    return key.startswith("ICC") or key == "PNG:ProfileName"
+    # PNG:ICC_Profile: ExifTool's tag for an iCCP chunk (or a raw profile text chunk) it cannot
+    # decode as ICC; Keep.icc keeps those chunks as stored.
+    return key.startswith("ICC") or key in ("PNG:ProfileName", "PNG:ICC_Profile")
 
 
 def keys(d):
@@ -93,10 +95,13 @@ CHECKS = {"all": check_all, "keep": check_keep, "orient1": check_orient1}
 
 
 def frames(path):
-    """Mode, size and pixel hash of every frame."""
+    """Mode, size and pixel hash of every frame. JPEG: the first frame only. Pillow opens a
+    JPEG with an MPF segment as MPO, whose later frames are the images after EOI, which strip
+    drops by design (docs/design.md)."""
     with Image.open(path) as im:
         out = []
-        for i in range(getattr(im, "n_frames", 1)):
+        n = 1 if im.format in ("JPEG", "MPO") else getattr(im, "n_frames", 1)
+        for i in range(n):
             im.seek(i)
             im.load()
             out.append((im.mode, im.size, hashlib.sha256(im.tobytes()).hexdigest()))

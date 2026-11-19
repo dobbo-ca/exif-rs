@@ -3,14 +3,13 @@
 use std::ops::Range;
 
 use super::{
-    Container, EXIF_PREFIX, Raw, Walk, Want, be16, be32, capped_copy, out_vec, splice_one,
+    Container, EXIF_PREFIX, Raw, Walk, Want, XMP_SIG, be16, be32, capped_copy, out_vec, splice_one,
     xmp_span, zeroed,
 };
 use crate::budget::Budget;
 use crate::rewrite::{MIN_EXIF_LEN, kept_exif, reset_exif_in_place};
 use crate::{Error, Keep, Limit, Limits};
 
-const XMP_SIG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXT_SIG: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const ICC_SIG: &[u8] = b"ICC_PROFILE\0";
 
@@ -205,6 +204,22 @@ fn sum_icc(lens: &[Option<usize>; 256], count: u8) -> Option<usize> {
     lens.get(1..=usize::from(count))?
         .iter()
         .try_fold(0usize, |t, l| t.checked_add((*l)?))
+}
+
+/// The offset in `data` of the TIFF header of the EXIF block that [`extract`] takes (the first
+/// APP1 `Exif\0\0`).
+pub(crate) fn exif_start(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+) -> Result<Option<usize>, Error> {
+    let mut segs = Segments::new(data, limits, budget);
+    while let Item::Seg(s) = segs.step()? {
+        if s.marker == 0xE1 && s.payload(data).starts_with(EXIF_PREFIX) {
+            return Ok(Some(s.pstart + EXIF_PREFIX.len()));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn extract(

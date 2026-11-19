@@ -346,7 +346,7 @@ fn bad_header_is_malformed() {
         b"",
         b"II*\0",
         b"XX*\0\x08\0\0\0",
-        b"II\0*\x08\0\0\0",
+        b"I\0*\0\x08\0\0\0",
         b"Exif\0\0",
     ];
     for b in bad {

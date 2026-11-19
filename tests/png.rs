@@ -35,6 +35,57 @@ fn xmp_itxt_plain_and_compressed() {
 }
 
 #[test]
+fn xmp_text_and_ztxt() {
+    // As ExifTool: the XMP keyword in tEXt and zTXt too; the bytes as stored, UTF-8 or not.
+    let p = [
+        b"<?xpacket begin=\"\xef\xbb\xbf\xa9\"?>".as_slice(),
+        xmp_plain().as_bytes(),
+    ]
+    .concat();
+    let mut t = b"XML:com.adobe.xmp\0".to_vec();
+    t.extend_from_slice(&p);
+    let mut z = b"XML:com.adobe.xmp\0\0".to_vec();
+    z.extend_from_slice(&zlib_stored(&p));
+    for c in [chunk(b"tEXt", &t), chunk(b"zTXt", &z)] {
+        assert_eq!(raw_of(&[c]).xmp, Some(p.clone()));
+    }
+    // The first XMP chunk wins.
+    let raw = raw_of(&[chunk(b"tEXt", &t), itxt_xmp(b"<two/>", false)]);
+    assert_eq!(raw.xmp, Some(p));
+}
+
+#[test]
+fn raw_profiles_xmp_app1_xmp_and_icc() {
+    let p = xmp_plain().into_bytes();
+    let app1 = [b"http://ns.adobe.com/xap/1.0/\0".as_slice(), &p].concat();
+    for c in [
+        ztxt_profile("Raw profile type xmp", &p),
+        text_profile("Raw profile type xmp", &p),
+        text_profile("Raw profile type APP1", &app1),
+    ] {
+        let raw = raw_of(&[c]);
+        assert_eq!(raw.xmp, Some(p.clone()));
+        assert!(raw.exif.is_none());
+    }
+    for k in ["Raw profile type icc", "Raw profile type icm"] {
+        let raw = raw_of(&[ztxt_profile(k, b"profile bytes")]);
+        assert_eq!(raw.icc.as_deref(), Some(&b"profile bytes"[..]));
+    }
+    // iCCP wins over a raw profile, before or after it.
+    for order in [false, true] {
+        let mut cs = vec![ztxt_profile("Raw profile type icc", b"raw"), iccp(b"iccp")];
+        if order {
+            cs.reverse();
+        }
+        assert_eq!(raw_of(&cs).icc.as_deref(), Some(&b"iccp"[..]));
+    }
+    // A length that the hex text cannot hold is not a profile (and allocates nothing).
+    let mut d = b"Raw profile type icc\0".to_vec();
+    d.extend_from_slice(b"\nicc\n 999999999999\n00\n");
+    assert!(raw_of(&[chunk(b"tEXt", &d)]).icc.is_none());
+}
+
+#[test]
 fn other_itxt_is_not_xmp() {
     let mut d = b"Comment\0\0\0\0\0\0".to_vec();
     d.extend_from_slice(b"hello");

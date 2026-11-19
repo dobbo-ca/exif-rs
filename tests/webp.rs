@@ -40,6 +40,14 @@ fn xmp_and_icc() {
 }
 
 #[test]
+fn xmp_nul_fourcc() {
+    // "XMP\0" instead of "XMP ", as some writers do; ExifTool reads it as XMP.
+    let p = xmp_plain();
+    let raw = raw_of(&[riff_chunk(b"XMP\0", p.as_bytes())]);
+    assert_eq!(raw.xmp.as_deref(), Some(p.as_bytes()));
+}
+
+#[test]
 fn riff_size_is_not_trusted() {
     let t = t6();
     let mut f = webp(&[vp8x(0x08, 16, 8), vp8(), riff_chunk(b"EXIF", &t)]);
