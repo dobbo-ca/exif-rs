@@ -11,7 +11,7 @@ use crate::{ByteOrder, Error, Exif, Limits};
 /// [`Keep::default()`] keeps everything that is not the metadata `strip` is for (every field
 /// `true`); [`Keep::NONE`] keeps nothing that can be dropped. The default changed after v1: the v1
 /// default was what `Keep::NONE` is now (no orientation, no ICC profile, no unknown JPEG
-/// segment, PNG chunk or WebP chunk, nothing after a JPEG EOI).
+/// segment, PNG chunk or WebP chunk, nothing after a JPEG EOI, a PNG IEND or a WebP RIFF size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keep {
     /// Keep the EXIF IFD0 Orientation, in a new minimal EXIF block (nothing else of the EXIF).
@@ -26,9 +26,10 @@ pub struct Keep {
     /// JPEG: keep the MPF secondary images after the primary image (an Ultra HDR gain map, other
     /// MP images) and the APP2 `MPF` segment, whose offsets are fixed. Needs `trailing`.
     pub mpf_images: bool,
-    /// JPEG: keep the bytes after the EOI of the primary image (MPF images, a Motion Photo or
-    /// Live Photo video, any other bytes), as stored. `false` drops all of them, the MPF images
-    /// included.
+    /// Keep the bytes after the image, as stored: in a JPEG those after the EOI of the primary
+    /// image (MPF images, a Motion Photo or Live Photo video, any other bytes), in a PNG those
+    /// after IEND, in a WebP those after the end the RIFF size gives (and its pad byte). They are
+    /// not parsed: metadata in them stays. `false` drops all of them, the MPF images included.
     pub trailing: bool,
 }
 
@@ -64,8 +65,8 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 /// `keep` does not name. The image data bytes are never changed.
 ///
 /// [`Keep::default()`] keeps the orientation, the ICC profile, unknown JPEG segments and PNG /
-/// WebP chunks, the MPF images and the bytes after the JPEG EOI; [`Keep::NONE`] gives the v1
-/// default output.
+/// WebP chunks, the MPF images and the bytes after the image (after the JPEG EOI, the PNG IEND,
+/// the WebP RIFF size); [`Keep::NONE`] gives the v1 default output.
 ///
 /// - JPEG: always drops the EXIF APP1 segments (`Exif\0` within the first bytes, as ExifTool
 ///   finds them), the XMP APP1 segments (standard, extended, and the other headers ExifTool
@@ -90,10 +91,12 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 ///   critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB,
 ///   cICP, mDCV, cLLI, bKGD, hIST, pHYs, sPLT, the APNG chunks), iCCP and the `Raw profile type
 ///   icc` / `icm` text chunks with `keep.icc`, and every other chunk with `keep.unknown`, as
-///   stored and in place. The new `eXIf` goes right before the first IDAT.
+///   stored and in place, and with `keep.trailing` the bytes after IEND, as they are. The new
+///   `eXIf` goes right before the first iDOT or IDAT.
 /// - WebP: always drops `EXIF`, `XMP ` and `XMP\0`. Keeps VP8X, VP8, VP8L, ALPH, ANIM and ANMF,
 ///   ICCP with `keep.icc`, and every other chunk with `keep.unknown`, as stored and in place
-///   with its pad byte. Fixes the VP8X flags and the RIFF size.
+///   with its pad byte. Fixes the VP8X flags and the RIFF size. With `keep.trailing` the bytes
+///   after the end the RIFF size gives (and its pad byte) follow, as they are.
 ///
 /// With `keep.orientation` the output has a new minimal EXIF block in the source byte order
 /// when the input has an EXIF IFD0 Orientation (in a simple WebP file, whose VP8X chunk is

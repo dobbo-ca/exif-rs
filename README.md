@@ -21,10 +21,11 @@ let meta = exif::read(file, &limits, &cancel)?;
 if let Some(exif) = &meta.exif {
     println!("orientation {:?}, taken {:?}", exif.orientation(), exif.capture_time());
 }
-// Keep::default() drops the EXIF, XMP and IPTC metadata and keeps the rest: the orientation,
-// the ICC profile, unknown JPEG segments and PNG / WebP chunks, and the data after a JPEG's image
-// (an Ultra HDR gain map, a Motion Photo video), with the MPF offsets fixed. Keep::NONE drops all
-// of it (the v1 default).
+// Keep::default() drops the EXIF, XMP, IPTC, comment / text and timestamp metadata (the strip
+// docs list it) and keeps the rest: the orientation, the ICC profile, unknown JPEG segments and
+// PNG / WebP chunks, and the data after the image (an Ultra HDR gain map, a Motion Photo video,
+// bytes after a PNG IEND or the WebP RIFF size), with the MPF offsets fixed. Keep::NONE drops
+// all of it (the v1 default).
 let clean = exif::strip(file, Keep::default(), &limits, &cancel)?;
 let bare = exif::strip(file, Keep { orientation: true, ..Keep::NONE }, &limits, &cancel)?;
 ```

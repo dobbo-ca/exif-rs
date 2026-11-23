@@ -263,6 +263,11 @@ pub(crate) fn strip(
     if let Some(d) = out.get_mut(4..8) {
         d.copy_from_slice(&riff.to_le_bytes());
     }
+    if keep.trailing {
+        // After the RIFF data and its pad byte (when the size is odd), as ExifTool reads it.
+        let end = chunks.limit + (chunks.limit & 1);
+        out.extend_from_slice(data.get(end..).unwrap_or_default());
+    }
     Ok(out)
 }
 

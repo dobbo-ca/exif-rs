@@ -245,7 +245,9 @@ gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway
   outside XMP (tags ending in `Start` or `Offset`, such as `MPImage<n>:MPImageStart` or the
   `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` (the primary size), and
   `Composite:*`, which ExifTool derives in part from the dropped EXIF. For a JPEG the output must
-  end with the bytes after the original's primary image (its EOI found as exif-rs finds it).
+  end with the bytes after the original's primary image (its EOI found as exif-rs finds it), and
+  when the original's `MPImage1:MPImageLength` is the size of its primary image (SOI to EOI) the
+  output's must be the size of the output's.
   A PNG output must have no `eXIf`, `zxIf`, `zXIf`, `tIME`, `tEXt`, `zTXt` or `iTXt` chunk
   (but a `Raw profile type icc` / `icm` text chunk), and a WebP output no `EXIF`, `XMP ` or
   `XMP\0` chunk; other unknown chunks may remain. One `eXIf` / `EXIF` chunk is allowed when the
@@ -267,14 +269,21 @@ cannot decode while its original decodes is a failure.
 
 No public Ultra HDR or Motion Photo JPEG with a clear licence was found (libultrahdr's
 `tests/data` holds Apple gain maps only; the ExifTool and metadata-extractor-images samples have
-no gain map bytes or video, or no licence per file), so `tests/parity/gainmap.py` makes four
+no gain map bytes or video, or no licence per file), so `tests/parity/gainmap.py` makes five
 files in CI, deterministically:
 
 - `uhdr.jpg`: libultrahdr v2.0.2 `ultrahdr_app` (built with `UHDR_WRITE_XMP=1`; CI-only, see
   docs/dependencies.md) encodes a 64x64 P010 HDR and YUV420 SDR gradient (`-a 0 -b 1 -C 1 -c 1
   -t 1 -M 0`): primary with `hdrgm:Version`, a `Container:Directory`, the ISO 21496-1 APP2 and
   MPF, then the gain map JPEG.
-- `uhdr-orient.jpg`: `uhdr.jpg` with `exiftool -Orientation#=6`.
+- `uhdr-orient.jpg`: `uhdr.jpg` with `exiftool -Orientation#=6`, and the MPF primary size set
+  again (ExifTool does not rewrite MPF).
+- `uhdr-mpf-first.jpg`: `uhdr.jpg` with the MPF segment moved first (after SOI, or after APP0
+  JFIF) and `tiff:Orientation=" 6"` added to the primary XMP packet, the MPF entries set again.
+  libultrahdr writes MPF last, after the XMP, so strip and reset_orientation of the other files
+  move the MPF header and the gain map by the same amount; here strip drops the XMP and
+  reset_orientation shortens it (`" 6"` becomes `1`) between them, so the gain map's MPF offset
+  and the primary size change.
 - `motion.jpg`: a Pillow JPEG with a Motion Photo XMP packet (`Camera:MotionPhoto` and a
   directory of the primary and the video) and a fake mp4 (an `ftyp` and an `mdat` box) after
   the EOI.
@@ -283,12 +292,15 @@ files in CI, deterministically:
 
 Each is stripped in modes default, keep and orient1. Every output: Pillow pixels of the primary
 equal the input's. Modes default and orient1: `exiftool -b -MPImage2` of input and output equal
-the gain map bytes, so do the output bytes at `MPImage2:MPImageStart`/`MPImageLength`, Pillow
-pixels of that gain map equal, `ultrahdr_app -m 1 -o 2 -O 5` decodes the output to the same raw
-pixels as the input, and `Google:MotionPhotoVideo` (ExifTool finds it from the directory) equals
-the video; the output ends with the gain map and the video. Mode default: `XMP-hdrgm:Version`,
+the gain map bytes, so do the output bytes at `MPImage2:MPImageStart`/`MPImageLength`,
+`MPImage1:MPImageStart` is 0 and `MPImage1:MPImageLength` the primary image's size (SOI to EOI)
+in input and output, Pillow pixels of that gain map equal, `ultrahdr_app -m 1 -o 2 -O 5` decodes
+the output to the same raw pixels as the input (it finds the gain map by its SOI, not by MPF), and
+`Google:MotionPhotoVideo` (ExifTool finds it from the directory) equals the video; the output
+ends with the gain map and the video; `XMP-hdrgm:Version`,
 `XMP-GContainer:DirectoryItemSemantic`, `DirectoryItemLength` and `XMP-GCamera:MotionPhoto`
-equal the input's. Mode orient1: `IFD0:Orientation` is 1 where the input has one. Mode keep: no
+equal the input's. Mode orient1: `IFD0:Orientation` and `XMP-tiff:Orientation` are 1 where the
+input has them. Mode keep: no
 MPF image, no video, nothing after the primary image's EOI. A failed check, or inputs that cannot
 be made, set the status to 1. The summary lists the checks per file and mode.
 
