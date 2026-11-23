@@ -501,14 +501,48 @@ fn put_new(
     }
 }
 
-/// An APP1 payload ExifTool reads as EXIF: `Exif\0` in any case after at most 4 bytes, and a
-/// byte after it.
-fn is_exif_app1(p: &[u8]) -> bool {
-    (0..=4).any(|i| {
-        p.len() > i + 5
-            && p.get(i..i + 5)
-                .is_some_and(|w| w.eq_ignore_ascii_case(b"exif\0"))
+/// The TIFF block of an APP1 payload ExifTool reads as EXIF: `Exif\0` in any case after at most
+/// 4 bytes, and a byte after it; the block starts after that byte.
+fn exif_app1_tiff(p: &[u8]) -> Option<&[u8]> {
+    (0..=4).find_map(|i| {
+        p.get(i..i + 5)
+            .filter(|w| w.eq_ignore_ascii_case(b"exif\0"))
+            .and_then(|_| p.get(i + 6..))
     })
+}
+
+/// The minimal EXIF block for `keep.orientation`: from the first APP1 before the first scan
+/// that `strip` drops as EXIF ([`exif_app1_tiff`]) whose block has a valid IFD0 Orientation. The
+/// block [`extract`] takes (the first APP1 `Exif\0\0`) is read as it gives it, joined with its
+/// continuation segments; any other is the TIFF block of its segment.
+fn kept_orientation(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+) -> Result<Option<[u8; MIN_EXIF_LEN]>, Error> {
+    let mut extract_seen = false;
+    let mut segs = Segments::new(data, limits, budget);
+    while let Item::Seg(s) = segs.step()? {
+        let p = s.payload(data);
+        let Some(t) = exif_app1_tiff(p).filter(|_| s.marker == 0xE1) else {
+            continue;
+        };
+        let block = if !extract_seen && p.starts_with(EXIF_PREFIX) {
+            extract_seen = true;
+            extract(data, limits, budget, Want::EXIF)?.exif
+        } else {
+            Some(capped_copy(
+                budget,
+                t,
+                limits.max_exif_bytes,
+                Limit::ExifBytes,
+            )?)
+        };
+        if let Some(k) = kept_exif(block, limits, budget)? {
+            return Ok(Some(k));
+        }
+    }
+    Ok(None)
 }
 
 /// An APP1 payload ExifTool reads as XMP: standard or extended XMP, any other `http` header,
@@ -524,7 +558,7 @@ fn keep_segment(marker: u8, p: &[u8], keep: Keep) -> bool {
     match marker {
         0xE0 if p.starts_with(b"JFIF\0") => true,
         0xEE if p.starts_with(b"Adobe") => true,
-        0xE1 if is_exif_app1(p) || is_xmp_app1(p) => false,
+        0xE1 if exif_app1_tiff(p).is_some() || is_xmp_app1(p) => false,
         0xE2 if p.starts_with(ICC_SIG) => keep.icc,
         0xE2 if p.starts_with(MPF_SIG) => keep.mpf_images && keep.trailing,
         0xED if p.starts_with(PS_SIG) || p.starts_with(PS_OLD_SIG) => false,
@@ -755,11 +789,7 @@ pub(crate) fn strip(
     budget: &Budget,
 ) -> Result<Vec<u8>, Error> {
     let mut pending = if keep.orientation {
-        kept_exif(
-            extract(data, limits, budget, Want::EXIF)?.exif,
-            limits,
-            budget,
-        )?
+        kept_orientation(data, limits, budget)?
     } else {
         None
     };

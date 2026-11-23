@@ -38,6 +38,11 @@ Strip keeps data by default, with an option to drop it (the owner's "Metadata ru
   and `XMP\0` chunks among them, which ExifTool reads there too; v1 dropped them.
   A VP8X chunk added for the orientation now goes first
   (before any other chunk), not right before the VP8/VP8L chunk.
+- `Keep.orientation` takes the orientation from the first EXIF block `strip` drops that has a
+  valid IFD0 Orientation, not only from the block `extract` gives: also from a JPEG APP1 that
+  `strip` drops as EXIF (`EXIF\0\0`, `xxExif\0\0`, ...) and from a WebP `EXIF` chunk after the
+  RIFF size. Before, `Keep::default()` dropped those blocks and lost their orientation.
+  `read` and `extract` are unchanged.
 - MPF fix-up: `strip` sets the size of the primary image and the offsets of the images it moved
   in the first MPF segment; `reset_orientation` does the same when the XMP orientation value
   changes length.

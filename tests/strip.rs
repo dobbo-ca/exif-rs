@@ -142,6 +142,40 @@ fn jpeg_wrong_tiff_magic_is_read_and_kept() {
 }
 
 #[test]
+fn jpeg_orientation_from_an_upper_case_exif_app1_is_kept() {
+    // `EXIF\0\0`: strip drops it as EXIF (ExifTool reads it), extract does not take it.
+    let t = tiff(true, &[ascii(0x010F, "Canon"), short(true, 0x0112, 6)]);
+    let f = jpeg(&[seg(0xE1, &[b"EXIF\0\0".as_slice(), &t].concat()), dqt()]);
+    assert!(extract(&f, &limits(), &no_cancel()).unwrap().exif.is_none());
+    let want = jpeg(&[app1_exif(&min_exif(true, 6)), dqt()]);
+    for keep in [Keep::default(), ORIENTATION] {
+        let out = run_strip(&f, keep);
+        assert_eq!(out, want, "{keep:?}");
+        assert_eq!(orientation_of(&out), Some(6));
+    }
+    assert_eq!(run_strip(&f, NONE), jpeg(&[dqt()]));
+}
+
+#[test]
+fn jpeg_orientation_from_a_prefixed_exif_app1_is_kept() {
+    // `xxExif\0\0`: `Exif\0` after 2 bytes, then one byte; the TIFF block follows.
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 6)]);
+    let f = jpeg(&[
+        app0_jfif(),
+        seg(0xE1, &[b"xxExif\0\0".as_slice(), &t].concat()),
+        dqt(),
+    ]);
+    assert!(extract(&f, &limits(), &no_cancel()).unwrap().exif.is_none());
+    let want = jpeg(&[app0_jfif(), app1_exif(&min_exif(false, 6)), dqt()]);
+    for keep in [Keep::default(), ORIENTATION] {
+        let out = run_strip(&f, keep);
+        assert_eq!(out, want, "{keep:?}");
+        assert_eq!(orientation_of(&out), Some(6));
+    }
+    assert_eq!(run_strip(&f, NONE), jpeg(&[app0_jfif(), dqt()]));
+}
+
+#[test]
 fn jpeg_no_orientation_keeps_nothing() {
     let t = tiff(false, &[ascii(0x010F, "Canon")]);
     let f = jpeg(&[app1_exif(&t), dqt()]);
@@ -566,15 +600,17 @@ fn webp_metadata_past_a_short_riff_size_is_dropped() {
         riff_chunk(b"XMP\0", b"<x/>"),
         private.clone(),
     ]);
-    // The RIFF size ends before the EXIF chunk: the orientation is not seen, the metadata
-    // chunks after it still go.
+    // The RIFF size ends before the EXIF chunk: the metadata chunks after it still go, and the
+    // orientation of that EXIF chunk is kept.
     let head = webp(&[vp8x(0x0C, 16, 8), vp8()]);
     let mut g = f.clone();
     let riff = u32::try_from(head.len() - 8).unwrap();
     g[4..8].copy_from_slice(&riff.to_le_bytes());
-    let want = [webp(&[vp8x(0x00, 16, 8), vp8()]), private.clone()].concat();
+    let min = riff_chunk(b"EXIF", &min_exif(false, 6));
+    let want = [webp(&[vp8x(0x08, 16, 8), vp8(), min]), private.clone()].concat();
     assert_eq!(run_strip(&g, Keep::default()), want);
-    // A RIFF size under 4: every chunk is after it.
+    // A RIFF size under 4: every chunk is after it, and with no VP8X or VP8 in the RIFF data
+    // there is no minimal EXIF.
     for riff in [0u32, 4] {
         let mut g = f.clone();
         g[4..8].copy_from_slice(&riff.to_le_bytes());
@@ -587,6 +623,28 @@ fn webp_metadata_past_a_short_riff_size_is_dropped() {
         .concat();
         assert_eq!(run_strip(&g, Keep::default()), want, "riff={riff}");
     }
+}
+
+#[test]
+fn webp_orientation_past_a_short_riff_size_is_kept() {
+    // A simple file whose RIFF size ends after VP8, then an EXIF chunk with an `Exif\0\0` prefix.
+    let t = tiff(true, &[ascii(0x010F, "Canon"), short(true, 0x0112, 6)]);
+    let exif = riff_chunk(b"EXIF", &[b"Exif\0\0".as_slice(), &t].concat());
+    let f = [webp(&[vp8()]), exif].concat();
+    assert!(extract(&f, &limits(), &no_cancel()).unwrap().exif.is_none());
+    let want = webp(&[
+        vp8x(0x08, 16, 8),
+        vp8(),
+        riff_chunk(b"EXIF", &min_exif(true, 6)),
+    ]);
+    // Without keep.trailing the chunk is dropped with the other bytes after the RIFF size, but
+    // its orientation is kept too.
+    for keep in [Keep::default(), ORIENTATION] {
+        let out = run_strip(&f, keep);
+        assert_eq!(out, want, "{keep:?}");
+        assert_eq!(orientation_of(&out), Some(6));
+    }
+    assert_eq!(run_strip(&f, NONE), webp(&[vp8()]));
 }
 
 #[test]

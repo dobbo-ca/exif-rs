@@ -213,7 +213,12 @@ text (JPEG COM, PNG `tEXt` / `zTXt` / `iTXt`) and the PNG modification time (`tI
 `Keep` says what else stays; `Keep::default()` keeps all of it, `Keep::NONE` none (the v1
 default, which dropped ICC and orientation too). `Keep.orientation` keeps the EXIF IFD0
 Orientation (only it: a new minimal EXIF block in the source byte order: TIFF header, IFD0 with
-one SHORT entry 0x0112, next IFD 0). `Keep.icc` keeps the ICC profile bytes as stored.
+one SHORT entry 0x0112, next IFD 0), from the first EXIF block strip drops that has a valid IFD0
+Orientation: in a JPEG the APP1 segments strip drops as EXIF, in order (the first `Exif\0\0` one
+read joined with its continuation segments, as `extract` gives it; any other from the TIFF header
+after its `Exif\0` and one byte), in a WebP the `EXIF` chunks within the RIFF size, then those
+after it. So it can come from a block `read` does not report (an `EXIF\0\0` or `xxExif\0\0`
+APP1, an `EXIF` chunk after a WebP's RIFF size). `Keep.icc` keeps the ICC profile bytes as stored.
 `Keep.unknown` keeps the JPEG APPn segments and the PNG and WebP chunks that are not known
 metadata or image data. `Keep.trailing` keeps the bytes after the image (the JPEG EOI, the PNG
 IEND, the end the WebP RIFF size gives), as stored and not parsed (but for the WebP metadata
@@ -291,7 +296,9 @@ it) the MPF images among them (JPEG only). The image data bytes are never change
   `XMP\0` chunks there: ExifTool reads chunks to the end of the file, so strip reads them as
   chunks too (charged to `max_segments`) and drops those, and copies the rest from the first
   bytes that are not a whole chunk on. A RIFF size that ends before the metadata chunks (or is
-  under 4) cannot hide them from strip.
+  under 4) cannot hide them from strip, and the orientation of an `EXIF` chunk there is kept
+  (with or without `keep.trailing`) when the RIFF data has a VP8X, or a VP8 / VP8L that gives
+  the size.
 
 `reset_orientation` changes only orientation values to 1, every other byte stays: the first value
 of the EXIF IFD0 Orientation in place (the first entry; none when it is not an integer type), in
