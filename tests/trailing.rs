@@ -397,6 +397,24 @@ fn ultra_hdr_motion_photo() {
             let p = photo(be, mpf_first, true, VIDEO, "6");
             let out = run(&p.file, Keep::default());
             check_tail(&out, &p, &at);
+            // Keep-lists that keep the MPF images but drop a segment (ICC, the ISO APP2, the
+            // EXIF) that lies between the MPF header and the gain map when mpf_first.
+            for keep in [
+                Keep {
+                    icc: false,
+                    ..Keep::default()
+                },
+                Keep {
+                    unknown: false,
+                    ..Keep::default()
+                },
+                Keep {
+                    orientation: false,
+                    ..Keep::default()
+                },
+            ] {
+                check_tail(&run(&p.file, keep), &p, &format!("{at} {keep:?}"));
+            }
             let packet = kept_packet(&out, &at);
             for want in [
                 "hdrgm:Version",

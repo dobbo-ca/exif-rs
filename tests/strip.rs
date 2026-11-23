@@ -530,8 +530,9 @@ fn webp_bytes_after_the_riff_size_follow_keep_trailing() {
         trailing: false,
         ..Keep::default()
     };
+    // ExifTool reads the EXIF chunk there: it goes; the bytes that are not a chunk stay.
     let cases = [
-        (Keep::default(), [body.as_slice(), &tail].concat()),
+        (Keep::default(), [body.as_slice(), b"TRAILER!"].concat()),
         (no_trailing, body),
         (NONE, webp(&[vp8x(0x00, 16, 8), vp8()])),
     ];
@@ -551,6 +552,55 @@ fn webp_bytes_after_the_riff_size_follow_keep_trailing() {
     ]
     .concat();
     assert_eq!(run_strip(&g, Keep::default()), want);
+}
+
+#[test]
+fn webp_metadata_past_a_short_riff_size_is_dropped() {
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 6)]);
+    let private = riff_chunk(b"prVt", b"odd");
+    let f = webp(&[
+        vp8x(0x0C, 16, 8),
+        vp8(),
+        riff_chunk(b"EXIF", &t),
+        riff_chunk(b"XMP ", xmp_plain().as_bytes()),
+        riff_chunk(b"XMP\0", b"<x/>"),
+        private.clone(),
+    ]);
+    // The RIFF size ends before the EXIF chunk: the orientation is not seen, the metadata
+    // chunks after it still go.
+    let head = webp(&[vp8x(0x0C, 16, 8), vp8()]);
+    let mut g = f.clone();
+    let riff = u32::try_from(head.len() - 8).unwrap();
+    g[4..8].copy_from_slice(&riff.to_le_bytes());
+    let want = [webp(&[vp8x(0x00, 16, 8), vp8()]), private.clone()].concat();
+    assert_eq!(run_strip(&g, Keep::default()), want);
+    // A RIFF size under 4: every chunk is after it.
+    for riff in [0u32, 4] {
+        let mut g = f.clone();
+        g[4..8].copy_from_slice(&riff.to_le_bytes());
+        let want = [
+            b"RIFF\x04\0\0\0WEBP".as_slice(),
+            &vp8x(0x0C, 16, 8),
+            &vp8(),
+            &private,
+        ]
+        .concat();
+        assert_eq!(run_strip(&g, Keep::default()), want, "riff={riff}");
+    }
+}
+
+#[test]
+fn webp_second_or_short_vp8x_is_always_dropped() {
+    let f = webp(&[
+        vp8x(0x00, 16, 8),
+        vp8x(0x00, 16, 8),
+        riff_chunk(b"VP8X", b"short"),
+        vp8(),
+    ]);
+    assert_eq!(
+        run_strip(&f, Keep::default()),
+        webp(&[vp8x(0x00, 16, 8), vp8()])
+    );
 }
 
 // ---- reset_orientation ----

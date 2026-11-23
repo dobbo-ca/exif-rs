@@ -28,8 +28,10 @@ pub struct Keep {
     pub mpf_images: bool,
     /// Keep the bytes after the image, as stored: in a JPEG those after the EOI of the primary
     /// image (MPF images, a Motion Photo or Live Photo video, any other bytes), in a PNG those
-    /// after IEND, in a WebP those after the end the RIFF size gives (and its pad byte). They are
-    /// not parsed: metadata in them stays. `false` drops all of them, the MPF images included.
+    /// after IEND, in a WebP those after the end the RIFF size gives (and its pad byte). In a JPEG
+    /// and a PNG they are not parsed: metadata in them stays. In a WebP they are read as chunks,
+    /// as ExifTool reads them, and the `EXIF`, `XMP ` and `XMP\0` chunks among them are dropped.
+    /// `false` drops all of them, the MPF images included.
     pub trailing: bool,
 }
 
@@ -93,10 +95,12 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 ///   icc` / `icm` text chunks with `keep.icc`, and every other chunk with `keep.unknown`, as
 ///   stored and in place, and with `keep.trailing` the bytes after IEND, as they are. The new
 ///   `eXIf` goes right before the first iDOT or IDAT.
-/// - WebP: always drops `EXIF`, `XMP ` and `XMP\0`. Keeps VP8X, VP8, VP8L, ALPH, ANIM and ANMF,
-///   ICCP with `keep.icc`, and every other chunk with `keep.unknown`, as stored and in place
-///   with its pad byte. Fixes the VP8X flags and the RIFF size. With `keep.trailing` the bytes
-///   after the end the RIFF size gives (and its pad byte) follow, as they are.
+/// - WebP: always drops `EXIF`, `XMP ` and `XMP\0`, and a VP8X that is not the first one or is
+///   shorter than 10 bytes. Keeps the first VP8X, VP8, VP8L, ALPH, ANIM and ANMF, ICCP with
+///   `keep.icc`, and every other chunk with `keep.unknown`, as stored and in place with its pad
+///   byte. Fixes the VP8X flags and the RIFF size. With `keep.trailing` the bytes after the end
+///   the RIFF size gives (and its pad byte) follow, as they are but for the `EXIF`, `XMP ` and
+///   `XMP\0` chunks among them (read as chunks up to the first bytes that are not a whole one).
 ///
 /// With `keep.orientation` the output has a new minimal EXIF block in the source byte order
 /// when the input has an EXIF IFD0 Orientation (in a simple WebP file, whose VP8X chunk is
