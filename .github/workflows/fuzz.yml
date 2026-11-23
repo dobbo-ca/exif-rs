@@ -6,6 +6,9 @@ on:
       max_total_time:
         description: Seconds per target
         default: '600'
+      targets:
+        description: Targets to run, a JSON list
+        default: '["exif", "xmp", "jpeg", "png", "webp", "read", "strip"]'
 permissions:
   contents: read
 # A new run waits for the one before it; it does not cancel it.
@@ -21,7 +24,8 @@ jobs:
       # The ARC runners are shared: two fuzz jobs at a time, at most.
       max-parallel: 2
       matrix:
-        target: [exif, xmp, jpeg, png, webp, read, strip]
+        # The schedule has no inputs: all targets.
+        target: ${{ fromJSON(inputs.targets || '["exif", "xmp", "jpeg", "png", "webp", "read", "strip"]') }}
     timeout-minutes: 60
     env:
       MAX_TOTAL_TIME: ${{ inputs.max_total_time || '600' }}

@@ -213,10 +213,10 @@ block, the XMP packet (standard and extended), IPTC / Photoshop (JPEG APP13) and
 default, which dropped ICC and orientation too). `Keep.orientation` keeps the EXIF IFD0
 Orientation (only it: a new minimal EXIF block in the source byte order: TIFF header, IFD0 with
 one SHORT entry 0x0112, next IFD 0). `Keep.icc` keeps the ICC profile bytes as stored.
-`Keep.unknown` keeps the JPEG APPn segments that are not known metadata. `Keep.trailing` keeps
-the bytes after the JPEG EOI, and `Keep.mpf_images` (with it) the MPF images among them. The
-image data bytes are never changed. PNG and WebP ignore `unknown`, `mpf_images` and `trailing`
-for now (they drop unlisted chunks as before; their wiring comes next).
+`Keep.unknown` keeps the JPEG APPn segments and the PNG and WebP chunks that are not known
+metadata or image data. `Keep.trailing` keeps the bytes after the JPEG EOI, and
+`Keep.mpf_images` (with it) the MPF images among them (JPEG only). The image data bytes are
+never changed.
 
 - **JPEG**: always dropped before the first SOS: APP1 EXIF (`Exif\0` in any case after at most
   4 bytes, as ExifTool finds it, continuation segments included), APP1 XMP (standard, extended,
@@ -267,13 +267,21 @@ for now (they drop unlisted chunks as before; their wiring comes next).
   a dropped item has padding, the packet has no directory at all. No packet when nothing is left
   or the APP1 length would not fit 16 bits. The packet is charged to the budget and the output
   buffer reserves room for it.
-- **PNG**: keep IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST,
-  pHYs, sPLT, acTL, fcTL, fdAT, and with `keep.icc` iCCP and the `Raw profile type icc` / `icm`
-  text chunks, verbatim. Drop all other chunks. The
-  minimal EXIF goes into a new `eXIf` chunk (CRC computed) right before the first IDAT.
-- **WebP**: keep VP8X, VP8 , VP8L, ALPH, ANIM, ANMF, and ICCP with `keep.icc`. Drop the rest.
+- **PNG**: always drop `eXIf` (and the once-proposed compressed EXIF chunks `zxIf` / `zXIf`),
+  `tIME` and the text chunks `tEXt`, `zTXt`, `iTXt` (XMP, ImageMagick raw profiles, comments).
+  Keep IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST, pHYs,
+  sPLT, acTL, fcTL, fdAT; with `keep.icc` iCCP and the `Raw profile type icc` / `icm` text
+  chunks; with `keep.unknown` every other chunk (private chunks, C2PA `caBX`, gain map chunks,
+  `oFFs`, `vpAg`, ...). Kept chunks are copied verbatim (CRC as stored) and in their input
+  order, so a chunk that had to come before PLTE or IDAT still does. The minimal EXIF goes into
+  a new `eXIf` chunk (CRC computed) right before the first IDAT (before IEND when there is no
+  IDAT), where the PNG specification wants it.
+- **WebP**: always drop `EXIF`, `XMP ` and `XMP\0`. Keep VP8X (the first one with at least 10
+  bytes), VP8 , VP8L, ALPH, ANIM, ANMF; ICCP with `keep.icc`; with `keep.unknown` every other
+  chunk, verbatim with its pad byte (a 0 is added when the data ends before it), in place.
   Clear the VP8X flags of what was dropped (EXIF 0x08, XMP 0x04, ICC 0x20), set EXIF when the
-  minimal EXIF chunk is added (at the end), and write the new RIFF size.
+  minimal EXIF chunk is added (at the end), and write the new RIFF size. A simple file that
+  gets the minimal EXIF gets a VP8X chunk first, before every kept chunk.
 
 `reset_orientation` changes only orientation values to 1, every other byte stays: the first value
 of the EXIF IFD0 Orientation in place (the first entry; none when it is not an integer type), in

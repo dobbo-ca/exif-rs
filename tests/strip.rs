@@ -283,6 +283,60 @@ fn png_truncated_is_truncated() {
     }
 }
 
+#[test]
+fn png_unknown_chunks_follow_keep_unknown() {
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 6)]);
+    let icc = iccp(b"profile");
+    let private = chunk(b"prVt", b"private data");
+    let cabx = chunk(b"caBX", b"jumbf");
+    let late = chunk(b"gmAP", b"after IDAT");
+    let f = png(&[
+        ihdr(),
+        icc.clone(),
+        private.clone(),
+        chunk(b"eXIf", &t),
+        itxt_xmp(xmp_plain().as_bytes(), false),
+        chunk(b"tEXt", b"Comment\0hi"),
+        ztxt_profile("Raw profile type xmp", b"<x/>"),
+        chunk(b"tIME", &[0x07, 0xEA, 11, 23, 12, 0, 0]),
+        chunk(b"zxIf", &t),
+        cabx.clone(),
+        idat(),
+        late.clone(),
+        iend(),
+    ]);
+    let min = chunk(b"eXIf", &min_exif(false, 6));
+    let no_unknown = Keep {
+        unknown: false,
+        ..Keep::default()
+    };
+    let cases = [
+        (
+            Keep::default(),
+            png(&[
+                ihdr(),
+                icc.clone(),
+                private,
+                cabx,
+                min.clone(),
+                idat(),
+                late,
+                iend(),
+            ]),
+        ),
+        (no_unknown, png(&[ihdr(), icc, min, idat(), iend()])),
+        (NONE, png(&[ihdr(), idat(), iend()])),
+    ];
+    for (keep, want) in cases {
+        let out = run_strip(&f, keep);
+        assert_eq!(out, want, "{keep:?}");
+        assert!(png_chunks(&out).iter().all(|c| c.2));
+        let raw = extract(&out, &limits(), &no_cancel()).unwrap();
+        assert!(raw.xmp.is_none());
+        assert_eq!(raw.exif.is_some(), keep.orientation);
+    }
+}
+
 // ---- WebP strip ----
 
 fn full_webp(be: bool) -> Vec<u8> {
@@ -346,6 +400,76 @@ fn webp_cut_is_never_a_panic() {
         );
         let _ = reset_orientation(&f[..n], &limits(), &no_cancel());
     }
+}
+
+#[test]
+fn webp_unknown_chunks_follow_keep_unknown() {
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 3)]);
+    let icc = riff_chunk(b"ICCP", b"icc");
+    // Odd length: stored with its pad byte.
+    let private = riff_chunk(b"prVt", b"odd");
+    let c2pa = riff_chunk(b"C2PA", b"jumbf!");
+    let f = webp(&[
+        vp8x(0x2C, 16, 8),
+        icc.clone(),
+        private.clone(),
+        vp8(),
+        riff_chunk(b"EXIF", &t),
+        riff_chunk(b"XMP ", xmp_plain().as_bytes()),
+        riff_chunk(b"XMP\0", b"<x/>"),
+        c2pa.clone(),
+    ]);
+    let min = riff_chunk(b"EXIF", &min_exif(false, 3));
+    let no_unknown = Keep {
+        unknown: false,
+        ..Keep::default()
+    };
+    let cases = [
+        (
+            Keep::default(),
+            webp(&[
+                vp8x(0x28, 16, 8),
+                icc.clone(),
+                private,
+                vp8(),
+                c2pa,
+                min.clone(),
+            ]),
+        ),
+        (no_unknown, webp(&[vp8x(0x28, 16, 8), icc, vp8(), min])),
+        (NONE, webp(&[vp8x(0x00, 16, 8), vp8()])),
+    ];
+    for (keep, want) in cases {
+        let out = run_strip(&f, keep);
+        assert_eq!(out, want, "{keep:?}");
+        webp_chunks(&out);
+        let raw = extract(&out, &limits(), &no_cancel()).unwrap();
+        assert!(raw.xmp.is_none());
+        assert_eq!(raw.exif.is_some(), keep.orientation);
+    }
+}
+
+#[test]
+fn webp_added_vp8x_goes_before_kept_chunks() {
+    let private = riff_chunk(b"prVt", b"odd");
+    let exif = riff_chunk(b"EXIF", &min_exif(false, 6));
+    let f = webp(&[private.clone(), vp8(), exif.clone()]);
+    assert_eq!(
+        run_strip(&f, Keep::default()),
+        webp(&[vp8x(0x08, 16, 8), private, vp8(), exif])
+    );
+}
+
+#[test]
+fn webp_unknown_chunk_without_its_pad_byte_gets_one() {
+    let mut f = webp(&[vp8x(0x00, 16, 8), vp8(), riff_chunk(b"prVt", b"odd")]);
+    f.pop();
+    let riff = u32::try_from(f.len() - 8).unwrap();
+    f[4..8].copy_from_slice(&riff.to_le_bytes());
+    let want = webp(&[vp8x(0x00, 16, 8), vp8(), riff_chunk(b"prVt", b"odd")]);
+    let out = run_strip(&f, Keep::default());
+    assert_eq!(out, want);
+    webp_chunks(&out);
 }
 
 // ---- reset_orientation ----

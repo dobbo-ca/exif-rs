@@ -426,13 +426,18 @@ fn keep_chunk(kind: &[u8; 4], d: &[u8], keep: Keep) -> bool {
         | b"cICP" | b"mDCV" | b"cLLI" | b"bKGD" | b"hIST" | b"pHYs" | b"sPLT" | b"acTL"
         | b"fcTL" | b"fdAT" => true,
         b"iCCP" => keep.icc,
-        // An ICC profile stored as ImageMagick raw profile text.
+        // Text is metadata (XMP, raw EXIF / XMP profiles, comments), except an ICC profile
+        // stored as ImageMagick raw profile text.
         b"tEXt" | b"zTXt" | b"iTXt" => {
             keep.icc
                 && text_chunk(kind, d)
                     .is_some_and(|(k, _, _)| matches!(profile_kind(k), Some(Profile::Icc)))
         }
-        _ => false,
+        // EXIF (`zxIf` / `zXIf`: the once-proposed compressed EXIF chunks) and the
+        // modification time.
+        b"eXIf" | b"zxIf" | b"zXIf" | b"tIME" => false,
+        // Every other chunk (private, C2PA `caBX`, gain map, ...), as stored and in place.
+        _ => keep.unknown,
     }
 }
 
