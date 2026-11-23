@@ -15,7 +15,7 @@ Strip keeps data by default, with an option to drop it (the owner's "Metadata ru
 - New `Keep` fields: `unknown` (JPEG APPn segments, PNG chunks and WebP chunks that are not known
   metadata or image data, kept as stored and in place), `mpf_images` (the MPF secondary images,
   such as an Ultra HDR gain map, and the MPF segment) and `trailing` (the bytes after the image,
-  as stored and not parsed: after the JPEG EOI MPF images, a Motion Photo or Live Photo video,
+  as stored and, but for the WebP metadata chunks, not parsed: after the JPEG EOI MPF images, a Motion Photo or Live Photo video,
   any other bytes; after the PNG IEND; after the end the WebP RIFF size gives and its pad byte).
   `mpf_images` is JPEG only.
 - JPEG strip always drops the EXIF, XMP (standard, extended and the other headers ExifTool reads
@@ -30,10 +30,12 @@ Strip keeps data by default, with an option to drop it (the owner's "Metadata ru
   `trailing` (on in `Keep::default()`) the bytes after IEND stay; v1 dropped them. The new `eXIf`
   goes right before the first IDAT, or before Apple's `iDOT` when that comes first (iDOT holds
   the offset of the first IDAT from itself).
-- WebP strip always drops `EXIF`, `XMP ` and `XMP\0`. With `unknown` (on in `Keep::default()`)
-  every other chunk the v1 list did not keep stays, as stored and in place with its pad byte; the
-  VP8X flags and the RIFF size follow. With `trailing` (on in `Keep::default()`) the bytes after
-  the end the RIFF size gives (and its pad byte) stay, after the new RIFF data; v1 dropped them.
+- WebP strip always drops `EXIF`, `XMP ` and `XMP\0`, and (as v1 did) a VP8X that is not the
+  first one or is shorter than 10 bytes. With `unknown` (on in `Keep::default()`) every other
+  chunk the v1 list did not keep stays, as stored and in place with its pad byte; the VP8X flags
+  and the RIFF size follow. With `trailing` (on in `Keep::default()`) the bytes after the end the
+  RIFF size gives (and its pad byte) stay, after the new RIFF data, but for the `EXIF`, `XMP `
+  and `XMP\0` chunks among them, which ExifTool reads there too; v1 dropped them.
   A VP8X chunk added for the orientation now goes first
   (before any other chunk), not right before the VP8/VP8L chunk.
 - MPF fix-up: `strip` sets the size of the primary image and the offsets of the images it moved

@@ -4,7 +4,8 @@
 # fuzz stage runs it with /seeds; fuzz.yml hands those directories to libFuzzer.
 #   exif   a TIFF block (little and big endian, truncated)
 #   xmp    [selector byte][packet], see fuzz_targets/xmp.rs
-#   jpeg, png, webp   small files with EXIF, XMP and (jpeg, png) more; the image data is a stub
+#   jpeg, png, webp   small files with EXIF, XMP and more (unknown chunks, bytes after IEND or
+#                     the RIFF size, a short RIFF size); the image data is a stub
 #   read   all the container seeds
 #   strip  [selector byte][file] for every container seed, five selectors each
 set -eu
@@ -135,6 +136,14 @@ hex=$({ printf 'Exif\000\000'; cat "$t/le.tiff"; } | od -An -v -tx1 | tr -d ' \n
   chunk IHDR "$t/ihdr"; chunk tEXt "$t/rawp"; chunk IDAT "$t/idat"; chunk IEND "$t/empty"
 } > "$out/png/rawprofile.png"
 head -c 70 "$out/png/full.png" > "$out/png/cut.png"
+# A private chunk, eXIf, Apple's iDOT before IDAT, and bytes after IEND.
+bytes 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 40 > "$t/idot"
+printf 'private' > "$t/prvt"
+{
+  bytes 137 80 78 71 13 10 26 10
+  chunk IHDR "$t/ihdr"; chunk prVt "$t/prvt"; chunk eXIf "$t/le.tiff"; chunk iDOT "$t/idot"; chunk IDAT "$t/idat"; chunk IEND "$t/empty"
+  printf 'TRAILER'
+} > "$out/png/extra.png"
 
 # ---- WebP: RIFF, VP8X (EXIF and XMP flags), VP8L stub, EXIF, XMP.
 rchunk() {
@@ -148,6 +157,11 @@ bytes 47 0 0 0 0 > "$t/vp8l"
 { rchunk VP8X "$t/vp8x"; rchunk VP8L "$t/vp8l"; rchunk EXIF "$t/le.tiff"; rchunk 'XMP ' "$t/a.xmp"; } | riff > "$out/webp/full.webp"
 { rchunk VP8X "$t/vp8x-exif"; rchunk VP8L "$t/vp8l"; rchunk EXIF "$t/be.tiff"; } | riff > "$out/webp/exif-be.webp"
 head -c 40 "$out/webp/full.webp" > "$out/webp/cut.webp"
+# An unknown chunk last, odd-sized and without its pad byte (an odd RIFF size).
+{ rchunk VP8X "$t/vp8x"; rchunk VP8L "$t/vp8l"; rchunk EXIF "$t/le.tiff"; printf 'prVt'; le32 3; printf 'odd'; } | riff > "$out/webp/unknown.webp"
+# full.webp with a RIFF size that ends after VP8L (EXIF, XMP and a trailer past it), and with 0.
+{ printf 'RIFF'; le32 36; tail -c +9 "$out/webp/full.webp"; printf 'TRAILER'; } > "$out/webp/short-riff.webp"
+{ printf 'RIFF'; le32 0; tail -c +9 "$out/webp/full.webp"; } > "$out/webp/zero-riff.webp"
 
 # ---- read: every container seed. strip: [selector][file]: 0 strips all, 3 keeps orientation and
 # ICC, 7 resets the orientation, 43 keeps all but the MPF images, 59 keeps all (Keep::default()).

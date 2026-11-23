@@ -216,7 +216,8 @@ Orientation (only it: a new minimal EXIF block in the source byte order: TIFF he
 one SHORT entry 0x0112, next IFD 0). `Keep.icc` keeps the ICC profile bytes as stored.
 `Keep.unknown` keeps the JPEG APPn segments and the PNG and WebP chunks that are not known
 metadata or image data. `Keep.trailing` keeps the bytes after the image (the JPEG EOI, the PNG
-IEND, the end the WebP RIFF size gives), as stored and not parsed, and `Keep.mpf_images` (with
+IEND, the end the WebP RIFF size gives), as stored and not parsed (but for the WebP metadata
+chunks there, below), and `Keep.mpf_images` (with
 it) the MPF images among them (JPEG only). The image data bytes are never changed.
 
 - **JPEG**: always dropped before the first SOS: APP1 EXIF (`Exif\0` in any case after at most
@@ -279,14 +280,18 @@ it) the MPF images among them (JPEG only). The image data bytes are never change
   IDAT), where the PNG specification wants it, or before Apple's `iDOT` when that comes first
   (iDOT holds the offset of the first IDAT from its own start). With `keep.trailing` the bytes
   after IEND are copied as they are.
-- **WebP**: always drop `EXIF`, `XMP ` and `XMP\0`. Keep VP8X (the first one with at least 10
-  bytes), VP8 , VP8L, ALPH, ANIM, ANMF; ICCP with `keep.icc`; with `keep.unknown` every other
+- **WebP**: always drop `EXIF`, `XMP ` and `XMP\0`, and every VP8X but the first one with at
+  least 10 bytes (a second or short VP8X, as v1 did). Keep that VP8X, VP8 , VP8L, ALPH, ANIM, ANMF; ICCP with `keep.icc`; with `keep.unknown` every other
   chunk, verbatim with its pad byte (a 0 is added when the data ends before it), in place.
   Clear the VP8X flags of what was dropped (EXIF 0x08, XMP 0x04, ICC 0x20), set EXIF when the
   minimal EXIF chunk is added (at the end), and write the new RIFF size. A simple file that
   gets the minimal EXIF gets a VP8X chunk first, before every kept chunk. With `keep.trailing`
   the bytes after the end the RIFF size gives (and its pad byte, when the size is odd, as
-  ExifTool reads it) follow the new RIFF data, as they are.
+  ExifTool reads it) follow the new RIFF data, as they are, but for the `EXIF`, `XMP ` and
+  `XMP\0` chunks there: ExifTool reads chunks to the end of the file, so strip reads them as
+  chunks too (charged to `max_segments`) and drops those, and copies the rest from the first
+  bytes that are not a whole chunk on. A RIFF size that ends before the metadata chunks (or is
+  under 4) cannot hide them from strip.
 
 `reset_orientation` changes only orientation values to 1, every other byte stays: the first value
 of the EXIF IFD0 Orientation in place (the first entry; none when it is not an integer type), in

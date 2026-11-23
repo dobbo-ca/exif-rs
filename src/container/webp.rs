@@ -265,8 +265,23 @@ pub(crate) fn strip(
     }
     if keep.trailing {
         // After the RIFF data and its pad byte (when the size is odd), as ExifTool reads it.
-        let end = chunks.limit + (chunks.limit & 1);
-        out.extend_from_slice(data.get(end..).unwrap_or_default());
+        // ExifTool reads chunks there too, so the metadata chunks are dropped; the rest is
+        // copied as it is, from the first bytes that are not a whole chunk on.
+        chunks.pos = chunks.limit + (chunks.limit & 1);
+        chunks.limit = data.len();
+        loop {
+            let at = chunks.pos;
+            match chunks.step()? {
+                Item::Chunk(c) if matches!(&c.kind, b"EXIF" | b"XMP " | b"XMP\0") => {}
+                Item::Chunk(c) => {
+                    out.extend_from_slice(data.get(c.start..c.end).unwrap_or_default())
+                }
+                Item::Done | Item::Trunc => {
+                    out.extend_from_slice(data.get(at..).unwrap_or_default());
+                    break;
+                }
+            }
+        }
     }
     Ok(out)
 }

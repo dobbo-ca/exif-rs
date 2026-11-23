@@ -203,8 +203,8 @@ with the reason:
 - exif-rs reads the first EXIF block and XMP packet of a file; ExifTool reads all of them.
 - The JPEG APP1 EXIF and XMP headers must be exact (`Exif\0\0`, the XMP namespace); ExifTool
   also takes up to 4 bytes before `Exif\0`, any byte after it, any case, and an `XMP\0` header.
-- WebP chunks after the end the RIFF size gives are not read (nor reset); ExifTool reads to the
-  end of the file.
+- WebP chunks after the end the RIFF size gives are not read (nor reset; strip drops the EXIF and
+  XMP chunks there); ExifTool reads to the end of the file.
 - A PNG raw profile whose hex holds fewer digits than its length says is not read, and one with
   more is cut at the length; ExifTool decodes all of the hex and warns.
 
@@ -243,7 +243,8 @@ gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway
   be in the original with the
   same value, except the values that move with the dropped segments before them: file positions
   outside XMP (tags ending in `Start` or `Offset`, such as `MPImage<n>:MPImageStart` or the
-  `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` (the primary size), and
+  `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` for any n (strip sets
+  the primary size in entry 0 and in every entry with offset 0, which is the primary too), and
   `Composite:*`, which ExifTool derives in part from the dropped EXIF. For a JPEG the output must
   end with the bytes after the original's primary image (its EOI found as exif-rs finds it), and
   when the original's `MPImage1:MPImageLength` is the size of its primary image (SOI to EOI) the
