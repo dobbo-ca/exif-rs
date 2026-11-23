@@ -12,8 +12,12 @@ All builds and tests run in CI (nothing runs on the owner's Mac).
 | `tests/png.rs` | PNG container: `eXIf`, `iTXt`/`zTXt`/`tEXt`, ImageMagick raw profiles, `iCCP`, inflate limits |
 | `tests/webp.rs` | WebP container: `EXIF`, `XMP `, `ICCP`, odd chunk padding, VP8X flags |
 | `tests/strip.rs` | `strip`, `Keep`, `reset_orientation` in all three containers; image data bytes unchanged |
+| `tests/trailing.rs` | JPEG data after the EOI: Ultra HDR (MPF in both byte orders and places), Motion Photo, both; `Keep::default()`, `trailing` and `mpf_images` off, `Keep::NONE` equal to v1; MPF and directory fix-up in `strip` and `reset_orientation`; unknown APPn; hostile MPF counts and offsets, absurd directory lengths, every cut |
 | `tests/resources.rs` | counting global allocator: peak within `max_alloc` + slack for `read` and `strip` at 64 KiB, 1 MiB and default; `LimitExceeded(Alloc)` when the data is larger; same result for `max_threads` 1 and 4; no thread spawn in `src/` |
 | `tests/limits_api.rs` | `Limits::default()` values, `Error::class` tokens, every `Limit` variant reached through the public API, cancel |
+
+Unit tests in `src/container/mpf.rs`: the MPF fix-up in both byte orders, images before and after
+the shift, a bad count, an entry out of range, cut blocks, the offset map.
 
 Doc-tests (the crate-level example in `src/lib.rs`) are compiled by `cargo test`.
 

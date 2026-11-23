@@ -13,7 +13,7 @@ an error may be any variant (the targets do not match on it).
 | `png` | `extract` and `read` on the raw input (the seeds are PNG files) | chunk walk, zTXt/iTXt/iCCP inflate under the budget, ImageMagick raw profile decode |
 | `webp` | `extract` and `read` on the raw input (the seeds are WebP files) | RIFF chunk walk, sizes and padding |
 | `read` | `read` on arbitrary bytes | container, EXIF and XMP together under one budget |
-| `strip` | `strip` and `reset_orientation` on arbitrary bytes | output is valid for the same container when `Ok`, image data bytes unchanged, no panic |
+| `strip` | `strip` (every `Keep` field from the selector byte) and `reset_orientation` on arbitrary bytes | output is valid for the same container when `Ok`, no XMP but the container description (only with `trailing`), no EXIF but the orientation, no ICC unless kept, no panic; seeds include an Ultra HDR + Motion Photo shape (MPF, directory XMP, gain map, video) |
 
 Every target uses a `max_alloc` far below `-malloc_limit_mb=512`; a peak above it is a bug in the
 charging.

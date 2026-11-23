@@ -6,25 +6,83 @@ use crate::budget::Budget;
 use crate::container::{self, Container, jpeg, png, webp};
 use crate::{ByteOrder, Error, Exif, Limits};
 
-/// What [`strip`] keeps.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What [`strip`] keeps besides the image data.
+///
+/// [`Keep::default()`] keeps everything that is not the metadata `strip` is for (every field
+/// `true`); [`Keep::NONE`] keeps nothing that can be dropped. The default changed after v1: the v1
+/// default was what `Keep::NONE` is now (no orientation, no ICC profile, nothing after a JPEG EOI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keep {
     /// Keep the EXIF IFD0 Orientation, in a new minimal EXIF block (nothing else of the EXIF).
     pub orientation: bool,
     /// Keep the ICC profile, as stored.
     pub icc: bool,
+    /// JPEG: keep the APPn segments that `strip` does not know as metadata, as stored and in
+    /// place (for example an ISO 21496-1 gain map APP2, an APP0 that is not JFIF, a FlashPix
+    /// APP2, an APP11 JUMBF box). PNG and WebP ignore this field for now: they drop the chunks
+    /// they do not list.
+    pub unknown: bool,
+    /// JPEG: keep the MPF secondary images after the primary image (an Ultra HDR gain map, other
+    /// MP images) and the APP2 `MPF` segment, whose offsets are fixed. Needs `trailing`.
+    pub mpf_images: bool,
+    /// JPEG: keep the bytes after the EOI of the primary image (MPF images, a Motion Photo or
+    /// Live Photo video, any other bytes), as stored. `false` drops all of them, the MPF images
+    /// included.
+    pub trailing: bool,
+}
+
+impl Keep {
+    /// Keeps nothing that can be dropped: the v1 `Keep::default()`. A JPEG keeps only SOI, APP0
+    /// `JFIF`, APP14 `Adobe`, the segments that are not APPn or COM, and the scans to the EOI.
+    pub const NONE: Keep = Keep {
+        orientation: false,
+        icc: false,
+        unknown: false,
+        mpf_images: false,
+        trailing: false,
+    };
+}
+
+impl Default for Keep {
+    /// Keeps everything that is not the metadata `strip` is for: every field `true`.
+    fn default() -> Self {
+        Keep {
+            orientation: true,
+            icc: true,
+            unknown: true,
+            mpf_images: true,
+            trailing: true,
+        }
+    }
 }
 
 /// The length of the minimal EXIF block: TIFF header, IFD0 with one entry, next IFD 0.
 pub(crate) const MIN_EXIF_LEN: usize = 26;
 
-/// Removes all metadata from a JPEG, PNG or WebP file, except what `keep` names. The image
-/// data bytes are never changed.
+/// Removes the EXIF, XMP and IPTC metadata from a JPEG, PNG or WebP file, and with it what
+/// `keep` does not name. The image data bytes are never changed.
 ///
-/// - JPEG: before the first scan keeps SOI, APP0 `JFIF` (as stored, with its thumbnail if it
-///   has one), APP14 `Adobe`, APP2 ICC (with
-///   `keep.icc`) and every other segment that is not an APPn or COM; from the first scan to
-///   the EOI the bytes are copied as they are; bytes after the EOI are dropped.
+/// [`Keep::default()`] keeps the orientation, the ICC profile, unknown JPEG segments, the MPF
+/// images and the bytes after the JPEG EOI; [`Keep::NONE`] gives the v1 default output.
+///
+/// - JPEG: always drops the EXIF APP1 segments (`Exif\0` within the first bytes, as ExifTool
+///   finds them), the XMP APP1 segments (standard, extended, and the other headers ExifTool
+///   reads as XMP), APP13 Photoshop (`Photoshop 3.0\0`, `Adobe_Photoshop2.5:`) and COM. Before
+///   the first scan it keeps SOI, APP0 `JFIF` (as stored, with its thumbnail if it has one),
+///   APP14 `Adobe`, every segment that is not an APPn or COM, APP2 ICC (with `keep.icc`), the
+///   APP2 `MPF` segments (with `keep.mpf_images` and `keep.trailing`) and every other APPn (with
+///   `keep.unknown`), as stored and in place. From the first scan to the EOI of the primary
+///   image the bytes are copied as they are. With `keep.trailing` the bytes after that EOI are
+///   copied as they are, except, without `keep.mpf_images`, the MPF images (entries after the
+///   first whose bytes lie after the EOI, start with `FF D8` and do not overlap an image before
+///   them). The first MPF segment is fixed: the size of the primary image and the offsets of
+///   the images that moved. When bytes after the EOI are kept and the standard XMP packet
+///   describes them (`hdrgm:Version`, a `Container:Directory`, the Motion Photo or MicroVideo
+///   fields of `http://ns.google.com/photos/1.0/camera/`), a new XMP packet with only those
+///   fields goes after the minimal EXIF (or where it would go). It has no `hdrgm:Version`, and
+///   the directory has no item for an image, when MPF images were dropped; when the directory
+///   items cannot be matched to the dropped images (located from the end of the file by
+///   `Item:Length` and `Item:Padding`), the packet has no directory.
 /// - PNG: keeps the critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM,
 ///   gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST, pHYs, sPLT, the APNG chunks, iCCP with
 ///   `keep.icc`, and with it the `Raw profile type icc` / `icm` text chunks) and drops the
@@ -36,17 +94,20 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 /// when the input has an EXIF IFD0 Orientation (in a simple WebP file, whose VP8X chunk is
 /// then added, only when the bitstream header gives the size).
 ///
-/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes); a copied
-/// EXIF block to `limits.max_exif_bytes` and `limits.max_alloc`; segments and chunks to
-/// `limits.max_segments`.
+/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes, plus the new
+/// XMP packet); a copied EXIF block to `limits.max_exif_bytes` and `limits.max_alloc`; segments
+/// and chunks to `limits.max_segments`. The scan of the JPEG XMP packet (only when bytes after
+/// the EOI are kept) and the offset map of the MPF fix-up are charged to `limits.max_alloc`; the
+/// scan checks the cancel flag every 1024 nodes.
 ///
 /// # Errors
 ///
 /// [`Error::UnknownFormat`]; [`Error::Truncated`] when a JPEG ends before its first scan or
 /// EOI, or a PNG or WebP file ends inside a chunk or before IEND; [`Error::Malformed`] for a
 /// byte that is not a JPEG marker or a PNG chunk length over 2^31-1;
-/// [`Error::LimitExceeded`] for `max_alloc`, `max_exif_bytes`, `max_segments` and the limits of
-/// [`Exif::parse`]; [`Error::OutOfMemory`]; [`Error::Cancelled`].
+/// [`Error::LimitExceeded`] for `max_alloc`, `max_exif_bytes`, `max_segments`, `max_xmp_bytes`,
+/// `max_xmp_nodes` and the limits of [`Exif::parse`]; [`Error::OutOfMemory`];
+/// [`Error::Cancelled`].
 pub fn strip(
     data: &[u8],
     keep: Keep,
@@ -75,8 +136,14 @@ pub fn strip(
 /// XMP, a PNG compressed `iTXt` XMP packet, and a PNG ImageMagick raw EXIF profile (`tEXt`,
 /// `zTXt`, `iTXt`); they are copied as they are.
 ///
-/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes), and so is
-/// the scan of the XMP packet, which checks the cancel flag every 1024 nodes.
+/// Every byte of a JPEG is kept, those after the EOI too (MPF images, a Motion Photo video).
+/// When the XMP value changes length (`" 6"` becomes `1`), the first APP2 `MPF` segment before
+/// the first scan is fixed: the offsets of the images after the value move with it, and the
+/// size of the primary image is set to its new length.
+///
+/// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes), and so are
+/// the scan of the XMP packet, which checks the cancel flag every 1024 nodes, and the offset map
+/// of the MPF fix-up.
 ///
 /// # Errors
 ///

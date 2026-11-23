@@ -66,10 +66,29 @@ FROM qemu-arm64 AS arm64
 RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --release --target aarch64-unknown-linux-gnu
 
+# libultrahdr's ultrahdr_app (google/libultrahdr v2.0.2, Apache-2.0 and MIT), a CI-only oracle: the
+# parity stage makes the Ultra HDR test files with it and decodes them (tests/parity/gainmap.py).
+# Never a crate dependency; no code of it is copied. Built with XMP on (UHDR_WRITE_XMP, off by
+# default), so the primary image carries hdrgm:Version and a Container:Directory, and against the
+# system libjpeg-turbo, so nothing else is fetched.
+FROM rust:1.99.1-bookworm AS ultrahdr
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build pkg-config g++ libjpeg62-turbo-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init -q /uhdr && cd /uhdr \
+    && git remote add origin https://github.com/google/libultrahdr \
+    && git fetch -q --depth 1 origin e5f5a022fe96fc4dc2ee35c19f733a50df807abe \
+    && git checkout -q FETCH_HEAD \
+    && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUHDR_BUILD_DEPS=0 -DUHDR_ENABLE_HEIF=0 \
+       -DUHDR_BUILD_TESTS=0 -DUHDR_WRITE_XMP=1 -DUHDR_WRITE_ISO=1 \
+    && cmake --build build --target ultrahdr_app \
+    && cp build/ultrahdr_app /usr/local/bin/ultrahdr_app \
+    && cd / && rm -rf /uhdr
+
 # The ExifTool oracle (perl is in the base image) and the Pillow that tests/parity/compare.py and
-# strip_check.py use. CI-only, installed before `COPY . .`; never a crate dependency.
+# strip_check.py use, and the libjpeg-turbo that ultrahdr_app links. CI-only, installed before
+# `COPY . .`; never a crate dependency.
 FROM toolchain AS oracle-tools
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pil git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pil git ca-certificates libjpeg62-turbo \
     && rm -rf /var/lib/apt/lists/*
 
 # ExifTool parity: fetch.sh puts ExifTool 13.64 and the metadata-extractor-images corpus into the
@@ -78,6 +97,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 # difference, so the report is kept; the workflow fails the job when /report/status is not 0 (if
 # run.sh wrote no status, the status of its exit is written here).
 FROM oracle-tools AS parity
+COPY --from=ultrahdr /usr/local/bin/ultrahdr_app /usr/local/bin/ultrahdr_app
 COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
@@ -95,7 +115,7 @@ FROM scratch AS parity-report
 COPY --from=parity /report /
 
 # The same oracle example built for x86_64 and for aarch64 (run under qemu-user) reads every 8th
-# input and strips it in all three modes; the outputs must be byte-identical. Outputs are deleted
+# input and strips it in all four modes; the outputs must be byte-identical. Outputs are deleted
 # at the end of the RUN, so the layer stays small.
 FROM qemu-tools AS parity-arm64
 COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
@@ -114,7 +134,7 @@ RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     && x=target/release/examples/oracle && a="qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/release/examples/oracle" \
     && $x read /work/in /out/x.jsonl && $a read /work/in /out/a.jsonl \
     && diff /out/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /out/x.jsonl) lines, identical" \
-    && for m in all keep orient1; do \
+    && for m in all keep default orient1; do \
          $x strip $m /work/in /out/x-$m && $a strip $m /work/in /out/a-$m \
          && diff -r /out/x-$m /out/a-$m && diff /out/x-$m.errors /out/a-$m.errors \
          && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \

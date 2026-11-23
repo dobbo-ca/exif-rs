@@ -7,21 +7,19 @@ use std::sync::atomic::AtomicBool;
 use common::*;
 use exif::{Error, Keep, Limit, Limits, extract, read, reset_orientation, strip};
 
-const NONE: Keep = Keep {
-    orientation: false,
-    icc: false,
-};
+const NONE: Keep = Keep::NONE;
 const ORIENTATION: Keep = Keep {
     orientation: true,
-    icc: false,
+    ..Keep::NONE
 };
 const ICC: Keep = Keep {
-    orientation: false,
     icc: true,
+    ..Keep::NONE
 };
 const BOTH: Keep = Keep {
     orientation: true,
     icc: true,
+    ..Keep::NONE
 };
 
 fn run_strip(f: &[u8], keep: Keep) -> Vec<u8> {

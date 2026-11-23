@@ -236,7 +236,7 @@ fn small_inputs_peak_within_max_alloc() {
             within(&format!("{at} read"), peak, max_alloc);
             drop(meta);
 
-            let (r, peak) = measured(|| exif::strip(data, Keep::default(), &lim, &no_cancel()));
+            let (r, peak) = measured(|| exif::strip(data, Keep::NONE, &lim, &no_cancel()));
             let out = r.unwrap_or_else(|e| panic!("{at}: strip: {e}"));
             assert!(out.len() < data.len(), "{at}: strip shrinks the file");
             within(&format!("{at} strip"), peak, max_alloc);
@@ -244,10 +244,15 @@ fn small_inputs_peak_within_max_alloc() {
             let keep = Keep {
                 orientation: true,
                 icc: true,
+                ..Keep::NONE
             };
             let (r, peak) = measured(|| exif::strip(data, keep, &lim, &no_cancel()));
             assert!(r.is_ok(), "{at}: strip keep: {r:?}");
             within(&format!("{at} strip keep"), peak, max_alloc);
+
+            let (r, peak) = measured(|| exif::strip(data, Keep::default(), &lim, &no_cancel()));
+            assert!(r.is_ok(), "{at}: strip default: {r:?}");
+            within(&format!("{at} strip default"), peak, max_alloc);
         }
     }
 }
@@ -268,8 +273,7 @@ fn max_alloc_smaller_than_data_is_alloc_error() {
     assert_eq!(r, alloc_err, "read png at 64 KiB");
     within("read png at 64 KiB", peak, lim.max_alloc);
 
-    let (r, peak) =
-        measured(|| exif::strip(&jpeg_big, Keep::default(), &lim, &no_cancel()).map(|_| ()));
+    let (r, peak) = measured(|| exif::strip(&jpeg_big, Keep::NONE, &lim, &no_cancel()).map(|_| ()));
     assert_eq!(r, alloc_err, "strip jpeg at 64 KiB");
     within("strip jpeg at 64 KiB", peak, lim.max_alloc);
 
@@ -277,8 +281,7 @@ fn max_alloc_smaller_than_data_is_alloc_error() {
     let (r, peak) = measured(|| exif::read(&jpeg_big, &lim, &no_cancel()).map(|_| ()));
     assert!(r.is_ok() || r == alloc_err, "read jpeg at 64 KiB: {r:?}");
     within("read jpeg at 64 KiB", peak, lim.max_alloc);
-    let (r, peak) =
-        measured(|| exif::strip(&png_big, Keep::default(), &lim, &no_cancel()).map(|_| ()));
+    let (r, peak) = measured(|| exif::strip(&png_big, Keep::NONE, &lim, &no_cancel()).map(|_| ()));
     assert!(r.is_ok() || r == alloc_err, "strip png at 64 KiB: {r:?}");
     within("strip png at 64 KiB", peak, lim.max_alloc);
 
@@ -291,7 +294,7 @@ fn max_alloc_smaller_than_data_is_alloc_error() {
             assert!(r.is_ok(), "{at}: read: {:?}", r.as_ref().map(|_| ()));
             within(&format!("{at} read"), peak, max_alloc);
             drop(r);
-            let (r, peak) = measured(|| exif::strip(data, Keep::default(), &lim, &no_cancel()));
+            let (r, peak) = measured(|| exif::strip(data, Keep::NONE, &lim, &no_cancel()));
             assert!(r.is_ok(), "{at}: strip: {:?}", r.as_ref().map(|_| ()));
             within(&format!("{at} strip"), peak, max_alloc);
         }
@@ -419,8 +422,8 @@ fn same_result_for_max_threads_1_and_4() {
         let b = exif::read(data, &four, &no_cancel()).map(|m| format!("{m:?}"));
         assert!(a.is_ok(), "read: {a:?}");
         assert_eq!(a, b, "read differs between max_threads 1 and 4");
-        let a = exif::strip(data, Keep::default(), &one, &no_cancel());
-        let b = exif::strip(data, Keep::default(), &four, &no_cancel());
+        let a = exif::strip(data, Keep::NONE, &one, &no_cancel());
+        let b = exif::strip(data, Keep::NONE, &four, &no_cancel());
         assert!(a.is_ok(), "strip: {a:?}");
         assert_eq!(a, b, "strip differs between max_threads 1 and 4");
     }

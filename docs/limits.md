@@ -46,11 +46,14 @@ per public call (`read` makes one `Budget` for the container, EXIF and XMP stage
 
 What is charged: copies of the EXIF, XMP and ICC blocks, parsed entry lists and values, XMP
 property strings and stacks, inflated PNG text, the output buffer of `strip` and
-`reset_orientation`, and the XMP scan of `reset_orientation`. What is not: small fixed-size
-allocations that do not scale with the input. `tests/resources.rs` measures the real peak with a
-counting allocator and asserts it stays within `max_alloc` plus a fixed slack, for `read`, `strip`
-and `reset_orientation`, a PNG whose iCCP inflates just past a doubling, and an XMP packet that
-nests deep, closes, then fills the budget.
+`reset_orientation` (with room for the new XMP packet of a JPEG strip), the XMP scans of
+`reset_orientation` and of a JPEG strip that keeps the bytes after the EOI (with its directory
+items and the new packet), the list of dropped MPF images, and the offset map of the MPF fix-up.
+What is not: small fixed-size allocations that do not scale with the input. `tests/resources.rs`
+measures the real peak with a counting allocator and asserts it stays within `max_alloc` plus a
+fixed slack, for `read`, `strip` (`Keep::NONE`, orientation and ICC, `Keep::default()`) and
+`reset_orientation`, a PNG whose iCCP inflates just past a doubling, and an XMP packet that nests
+deep, closes, then fills the budget.
 
 ## Cancel
 

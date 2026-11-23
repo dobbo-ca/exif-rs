@@ -10,8 +10,8 @@ Counts: see the latest parity run summary
 
 ## The run
 
-`tests/parity/run.sh <corpus> <oracle-binary> <report-dir>` (POSIX sh; needs perl, python3 and
-Pillow, otherwise it exits 2):
+`tests/parity/run.sh <corpus> <oracle-binary> <report-dir>` (POSIX sh; needs perl, python3,
+Pillow and ultrahdr_app; otherwise it exits 2):
 
 1. `tests/parity/inputs.sh <corpus> /work/in` makes a flat dir of symlinks to the inputs (see
    Corpus). ExifTool and the oracle both follow symlinks. `PARITY_EVERY_N=<n>` keeps every n-th.
@@ -27,9 +27,11 @@ Pillow, otherwise it exits 2):
    `max_threads = 1`) writes one JSON object per file with the same keys and value text, or
    `{"SourceFile":..., "Error": <Error::class()>}`.
 5. `tests/parity/compare.py` compares them (Read parity).
-6. `oracle strip all|keep|orient1 /work/in /work/strip/<mode>`, ExifTool on each output dir,
-   then `tests/parity/strip_check.py` (Strip checks).
-7. `<report-dir>/summary.md` holds the counts, `<report-dir>/status` is 0 (pass) or 1 (fail);
+6. `oracle strip all|keep|default|orient1 /work/in /work/strip/<mode>`, ExifTool on each output
+   dir, then `tests/parity/strip_check.py` (Strip checks).
+7. `tests/parity/gainmap.py` makes the Ultra HDR and Motion Photo files and checks their strips
+   (Ultra HDR and Motion Photo checks).
+8. `<report-dir>/summary.md` holds the counts, `<report-dir>/status` is 0 (pass) or 1 (fail);
    the script itself exits 0. `/work` is deleted.
 
 The oracle output is deterministic and the same on every platform (it formats numbers with Rust,
@@ -211,14 +213,14 @@ with the reason:
 `strip_check.py` reads ExifTool's JSON of each output and of its original. Every output of a mode
 is checked; the files exif-rs refused are counted by error class (`<mode>.errors`). A refusal
 fails the run unless it is a file without JPEG/PNG/WebP magic refused as `unknown-format`, or
-(modes all and keep only) a file that `tests/parity/strip-refusals.tsv` lists with that class:
-the truncated and malformed JPEG/PNG/WebP files strip refuses on purpose. In modes all and keep,
-when ExifTool reads the original without `ExifTool:Error`, the output must have no
-`ExifTool:Error` and the same `File:MIMEType` (`File:FileType` may change: a WebP file that gets
-a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway.
+(modes all, keep and default only) a file that `tests/parity/strip-refusals.tsv` lists with that
+class: the truncated and malformed JPEG/PNG/WebP files strip refuses on purpose. In modes all,
+keep and default, when ExifTool reads the original without `ExifTool:Error`, the output must have
+no `ExifTool:Error` and the same `File:MIMEType` (`File:FileType` may change: a WebP file that
+gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway.
 
-- **all** (`strip(Keep::default())`): only these keys may remain: groups `ExifTool`, `System`,
-  `JFIF`, `Adobe` (APP14), `PNG-pHYs`, `PNG-cICP`; `File` except `File:Comment` and
+- **all** (`strip(Keep::NONE)`, the v1 default): only these keys may remain: groups `ExifTool`,
+  `System`, `JFIF`, `Adobe` (APP14), `PNG-pHYs`, `PNG-cICP`; `File` except `File:Comment` and
   `File:ExifByteOrder`; `Composite:ImageSize`, `Megapixels`, `Duration`; `PNG:` tags of the
   kept chunks (ImageWidth, ImageHeight, BitDepth, ColorType, Compression, Filter, Interlace,
   Palette, Transparency, WhitePointX/Y, RedX/Y, GreenX/Y, BlueX/Y, Gamma, SignificantBits,
@@ -228,10 +230,21 @@ a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway.
   AnimationLoopCount, Duration, AlphaPreprocessing, AlphaFiltering, AlphaCompression). Anything
   else (IFD0, IFD1, ExifIFD, GPS, InteropIFD, MakerNotes, maker groups, XMP-*, IPTC, Photoshop,
   ICC*, PNG text, ...) is a failure.
-- **keep** (`strip(Keep { orientation: true, icc: true })`): as `all`, plus `IFD0:Orientation`
-  equal to the original's (absent when the original has none), `File:ExifByteOrder` only with
-  it, and every `ICC*` key (and `PNG:ProfileName`, and `PNG:ICC_Profile`, ExifTool's tag for an
-  ICC chunk it cannot decode) equal to the original's, none added or lost.
+- **keep** (`strip(Keep { orientation: true, icc: true, ..Keep::NONE })`): as `all`, plus
+  `IFD0:Orientation` equal to the original's (absent when the original has none),
+  `File:ExifByteOrder` only with it, and every `ICC*` key (and `PNG:ProfileName`, and
+  `PNG:ICC_Profile`, ExifTool's tag for an ICC chunk it cannot decode) equal to the original's,
+  none added or lost.
+- **default** (`strip(Keep::default())`): as `keep` for the orientation and the ICC keys; no key
+  of the groups IFD0 (but `IFD0:Orientation`), IFD1, ExifIFD, GPS, InteropIFD, SubIFD*,
+  MakerNotes and Photoshop, and no XMP key but `XMP-hdrgm:Version`, `XMP-GContainer:*` and the
+  Motion Photo / MicroVideo keys of `XMP-GCamera` (`XMP-rdf:About` is ignored). Every other key
+  (from the unknown APPn segments, the MPF segment, trailers) must be in the original with the
+  same value, except the values that move with the dropped segments before them: file positions
+  outside XMP (tags ending in `Start` or `Offset`, such as `MPImage<n>:MPImageStart` or the
+  `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` (the primary size), and
+  `Composite:*`, which ExifTool derives in part from the dropped EXIF. For a JPEG the output must
+  end with the bytes after the original's primary image (its EOI found as exif-rs finds it).
 - **orient1** (`reset_orientation`): every key equal to the original's except the `System`
   group (file name, size, dates) and `IFD0:Orientation` and `XMP-tiff:Orientation`, which are
   `1` when the original has them and absent when it does not.
@@ -239,10 +252,39 @@ a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway.
 Pixel check (all modes): Pillow decodes the original and the output (`Image.open`, then for every
 frame `seek`, `load`, and mode, size and a SHA-256 of `tobytes()`); they must be equal. For JPEG
 only the first frame counts: Pillow opens a JPEG with an MPF segment as MPO, whose other frames
-are the images after EOI, which strip drops by design. An
-original that Pillow cannot decode (truncated, hostile, decompression bomb) is skipped and
-counted by exception class. An output that Pillow cannot decode while its original decodes is a
-failure.
+are the images after EOI, which modes all and keep drop and mode default keeps (checked above and
+in the Ultra HDR and Motion Photo checks). An original that Pillow cannot decode (truncated,
+hostile, decompression bomb) is skipped and counted by exception class. An output that Pillow
+cannot decode while its original decodes is a failure.
+
+## Ultra HDR and Motion Photo checks
+
+No public Ultra HDR or Motion Photo JPEG with a clear licence was found (libultrahdr's
+`tests/data` holds Apple gain maps only; the ExifTool and metadata-extractor-images samples have
+no gain map bytes or video, or no licence per file), so `tests/parity/gainmap.py` makes four
+files in CI, deterministically:
+
+- `uhdr.jpg`: libultrahdr v2.0.2 `ultrahdr_app` (built with `UHDR_WRITE_XMP=1`; CI-only, see
+  docs/dependencies.md) encodes a 64x64 P010 HDR and YUV420 SDR gradient (`-a 0 -b 1 -C 1 -c 1
+  -t 1 -M 0`): primary with `hdrgm:Version`, a `Container:Directory`, the ISO 21496-1 APP2 and
+  MPF, then the gain map JPEG.
+- `uhdr-orient.jpg`: `uhdr.jpg` with `exiftool -Orientation#=6`.
+- `motion.jpg`: a Pillow JPEG with a Motion Photo XMP packet (`Camera:MotionPhoto` and a
+  directory of the primary and the video) and a fake mp4 (an `ftyp` and an `mdat` box) after
+  the EOI.
+- `uhdr-motion.jpg`: `uhdr.jpg` with that video after the gain map, a directory of the three
+  items, and the MPF entries set for the new primary length.
+
+Each is stripped in modes default, keep and orient1. Every output: Pillow pixels of the primary
+equal the input's. Modes default and orient1: `exiftool -b -MPImage2` of input and output equal
+the gain map bytes, so do the output bytes at `MPImage2:MPImageStart`/`MPImageLength`, Pillow
+pixels of that gain map equal, `ultrahdr_app -m 1 -o 2 -O 5` decodes the output to the same raw
+pixels as the input, and `Google:MotionPhotoVideo` (ExifTool finds it from the directory) equals
+the video; the output ends with the gain map and the video. Mode default: `XMP-hdrgm:Version`,
+`XMP-GContainer:DirectoryItemSemantic`, `DirectoryItemLength` and `XMP-GCamera:MotionPhoto`
+equal the input's. Mode orient1: `IFD0:Orientation` is 1 where the input has one. Mode keep: no
+MPF image, no video, nothing after the primary image's EOI. A failed check, or inputs that cannot
+be made, set the status to 1. The summary lists the checks per file and mode.
 
 ## Reading the report
 
@@ -252,8 +294,11 @@ failure.
   JPEG/PNG/WEBP, ExifTool file types, exif-rs error classes, skipped inputs, and per key the
   number of files compared, matched, mismatched and known. A key with 0 compared is not in the
   corpus.
-- Strip checks: per mode the outputs, exif-rs errors, unexpected refusals, files with tag
-  failures, pixel checks done, identical, failed and skipped (with reasons).
+- Strip checks: per mode (all, keep, default, orient1) the outputs, exif-rs errors, unexpected
+  refusals, files with tag failures, pixel checks done, identical, failed and skipped (with
+  reasons).
+- Ultra HDR and Motion Photo checks: per file and mode the checks run and passed, and the
+  failures.
 
 Lists: `read-mismatches.tsv` (file, key, ExifTool value, oracle value, as type and text),
 `strip-failures.tsv` (mode, file, tags or pixels, detail), `strip-<mode>.errors`, and

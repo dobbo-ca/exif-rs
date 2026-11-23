@@ -184,6 +184,240 @@ pub(crate) fn orientation_value_span(
     Ok(found)
 }
 
+const NS_CAMERA: &[u8] = b"http://ns.google.com/photos/1.0/camera/";
+const NS_CONTAINER: &[u8] = b"http://ns.google.com/photos/1.0/container/";
+const NS_ITEM: &[u8] = b"http://ns.google.com/photos/1.0/container/item/";
+/// The Motion Photo and MicroVideo fields a container description keeps, in output order.
+const CAMERA_FIELDS: [&str; 7] = [
+    "MotionPhoto",
+    "MotionPhotoVersion",
+    "MotionPhotoPresentationTimestampUs",
+    "MicroVideo",
+    "MicroVideoVersion",
+    "MicroVideoOffset",
+    "MicroVideoPresentationTimestampUs",
+];
+/// The `Container:Item` fields, in output order.
+const ITEM_FIELDS: [&str; 6] = ["Mime", "Semantic", "Length", "Padding", "Label", "URI"];
+/// The index of `Item:Length` in [`Item`].
+pub(crate) const ITEM_LENGTH: usize = 2;
+/// The index of `Item:Padding` in [`Item`].
+pub(crate) const ITEM_PADDING: usize = 3;
+
+/// The raw value ranges of the fields of one `Container:Item`: Mime, Semantic, Length, Padding,
+/// Label, URI.
+pub(crate) type Item = [Option<Range<usize>>; 6];
+
+/// What an XMP packet says about the data after a JPEG's primary image, as raw value ranges in
+/// the packet: the top-level `hdrgm:Version`, Motion Photo and MicroVideo fields (the first of
+/// each) and the items of `Container:Directory` in document order. The capacity of `items` is
+/// charged to the budget until it is dropped.
+pub(crate) struct ContainerDesc<'a, 'b> {
+    pub(crate) version: Option<Range<usize>>,
+    camera: [Option<Range<usize>>; 7],
+    pub(crate) items: Vec<Item>,
+    charged: usize,
+    budget: &'a Budget<'b>,
+}
+
+impl ContainerDesc<'_, '_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.version.is_none() && self.camera.iter().all(Option::is_none) && self.items.is_empty()
+    }
+
+    fn ranges(&self) -> impl Iterator<Item = &Range<usize>> {
+        self.version
+            .iter()
+            .chain(self.camera.iter().flatten())
+            .chain(self.items.iter().flatten().flatten())
+    }
+}
+
+impl Drop for ContainerDesc<'_, '_> {
+    fn drop(&mut self) {
+        self.budget.release(self.charged);
+    }
+}
+
+/// The container description of `packet` (a standard XMP packet). Items are `Container:Item`
+/// elements (namespace `http://ns.google.com/photos/1.0/container/`, under any prefix); their
+/// fields (namespace `http://ns.google.com/photos/1.0/container/item/`) are attributes of the
+/// item or simple properties inside it. The scan is charged to `budget` and checks its cancel
+/// flag every 1024 nodes.
+///
+/// # Errors
+///
+/// As [`Xmp::parse`]: `LimitExceeded` for `max_xmp_bytes`, `max_xmp_nodes` and `max_alloc`,
+/// `OutOfMemory`, `Cancelled`.
+pub(crate) fn container_desc<'a, 'b>(
+    packet: &[u8],
+    limits: &Limits,
+    budget: &'a Budget<'b>,
+) -> Result<ContainerDesc<'a, 'b>, Error> {
+    if packet.len() > limits.max_xmp_bytes {
+        return Err(Error::LimitExceeded(Limit::XmpBytes));
+    }
+    budget.check_cancel()?;
+    let mut d = ContainerDesc {
+        version: None,
+        camera: Default::default(),
+        items: Vec::new(),
+        charged: 0,
+        budget,
+    };
+    // The attributes reported next belong to a `Container:Item` start tag.
+    let mut in_item = false;
+    scan_events(packet, limits, budget, true, &mut |ev| {
+        match ev {
+            Ev::Start(ns, name) => {
+                in_item = ns == NS_CONTAINER && name == b"Item";
+                if in_item {
+                    reserve_one(&mut d.items, budget, &mut d.charged)?;
+                    d.items.push(Item::default());
+                }
+            }
+            Ev::Attr(ns, name, r) => {
+                if in_item && ns == NS_ITEM {
+                    set_item(&mut d.items, name, r);
+                }
+            }
+            Ev::Prop(ns, name, r, top) => {
+                in_item = false;
+                if top && ns == NS_HDRGM.as_bytes() && name == b"Version" {
+                    if d.version.is_none() {
+                        d.version = Some(r);
+                    }
+                } else if top && ns == NS_CAMERA {
+                    if let Some(i) = CAMERA_FIELDS.iter().position(|f| f.as_bytes() == name)
+                        && let Some(slot) = d.camera.get_mut(i)
+                        && slot.is_none()
+                    {
+                        *slot = Some(r);
+                    }
+                } else if !top && ns == NS_ITEM {
+                    set_item(&mut d.items, name, r);
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(d)
+}
+
+/// Sets the field `name` of the last item, unless it is set already.
+fn set_item(items: &mut [Item], name: &[u8], r: Range<usize>) {
+    if let Some(item) = items.last_mut()
+        && let Some(i) = ITEM_FIELDS.iter().position(|f| f.as_bytes() == name)
+        && let Some(slot) = item.get_mut(i)
+        && slot.is_none()
+    {
+        *slot = Some(r);
+    }
+}
+
+/// The raw text at `r` of `packet` as a number, surrounding whitespace ignored.
+pub(crate) fn number(packet: &[u8], r: &Range<usize>) -> Option<usize> {
+    std::str::from_utf8(packet.get(r.clone())?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A new XMP packet with the fields of `d` only: `x:xmpmeta`, one `rdf:Description` with
+/// `hdrgm:Version` and the Camera fields as attributes, then `Container:Directory` as an
+/// `rdf:Seq` of `rdf:li rdf:parseType="Resource"`, each with one `Container:Item` whose fields
+/// are attributes. The prefixes are always hdrgm, Camera, Container and Item. Values are decoded
+/// from `packet` (entities, CDATA) and escaped again. `None` when `d` is empty or the packet
+/// would be longer than `max` bytes. The packet is charged to the budget of `d`.
+///
+/// # Errors
+///
+/// `LimitExceeded(Alloc)`, `OutOfMemory`.
+pub(crate) fn container_packet(
+    packet: &[u8],
+    d: &ContainerDesc,
+    max: usize,
+) -> Result<Option<Vec<u8>>, Error> {
+    if d.is_empty() {
+        return Ok(None);
+    }
+    // Decoded text is never longer than the raw text, so this buffer does not grow.
+    let longest = d.ranges().map(|r| r.len()).max().unwrap_or(0);
+    let mut scratch = d.budget.vec::<u8>(longest)?;
+    let mut n = 0usize;
+    emit(packet, d, &mut scratch, &mut |b: &[u8]| {
+        n = n.saturating_add(b.len())
+    });
+    let out = if n > max {
+        None
+    } else {
+        let mut out = d.budget.vec::<u8>(n)?;
+        emit(packet, d, &mut scratch, &mut |b: &[u8]| {
+            out.extend_from_slice(b)
+        });
+        Some(out)
+    };
+    d.budget.release(longest);
+    Ok(out)
+}
+
+fn emit(packet: &[u8], d: &ContainerDesc, scratch: &mut Vec<u8>, w: &mut dyn FnMut(&[u8])) {
+    w(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF \
+        xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" \
+        xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" \
+        xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\" \
+        xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" \
+        xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"");
+    let raw = |r: &Range<usize>| packet.get(r.clone()).unwrap_or_default();
+    if let Some(r) = &d.version {
+        attr(w, scratch, raw(r), "hdrgm", "Version");
+    }
+    for (r, name) in d.camera.iter().zip(CAMERA_FIELDS) {
+        if let Some(r) = r {
+            attr(w, scratch, raw(r), "Camera", name);
+        }
+    }
+    if d.items.is_empty() {
+        w(b"/>");
+    } else {
+        w(b"><Container:Directory><rdf:Seq>");
+        for item in &d.items {
+            w(b"<rdf:li rdf:parseType=\"Resource\"><Container:Item");
+            for (r, name) in item.iter().zip(ITEM_FIELDS) {
+                if let Some(r) = r {
+                    attr(w, scratch, raw(r), "Item", name);
+                }
+            }
+            w(b"/></rdf:li>");
+        }
+        w(b"</rdf:Seq></Container:Directory></rdf:Description>");
+    }
+    w(b"</rdf:RDF></x:xmpmeta>");
+}
+
+/// ` prefix:name="value"`, the value decoded and escaped for a double-quoted attribute.
+fn attr(w: &mut dyn FnMut(&[u8]), scratch: &mut Vec<u8>, raw: &[u8], prefix: &str, name: &str) {
+    w(b" ");
+    w(prefix.as_bytes());
+    w(b":");
+    w(name.as_bytes());
+    w(b"=\"");
+    scratch.clear();
+    decode_text(raw, scratch);
+    for c in scratch.iter() {
+        let esc: &[u8] = match c {
+            b'&' => &b"&amp;"[..],
+            b'<' => &b"&lt;"[..],
+            b'>' => &b"&gt;"[..],
+            b'"' => &b"&quot;"[..],
+            _ => std::slice::from_ref(c),
+        };
+        w(esc);
+    }
+    w(b"\"");
+}
+
 fn collect(
     data: &[u8],
     limits: &Limits,
@@ -468,15 +702,43 @@ impl Stacks {
 type Sink<'a> =
     &'a mut dyn FnMut(&[u8], &[u8], Range<usize>, bool) -> Result<ControlFlow<()>, Error>;
 
+/// What [`scan_events`] reports, in document order.
+enum Ev<'a> {
+    /// A simple property: namespace URI, local name, raw value range, top-level.
+    Prop(&'a [u8], &'a [u8], Range<usize>, bool),
+    /// The start tag of a property element: namespace URI, local name.
+    Start(&'a [u8], &'a [u8]),
+    /// An attribute of the start tag reported just before, other than `xmlns`, `xml:*` and
+    /// `rdf:*`: namespace URI, local name, raw value range.
+    Attr(&'a [u8], &'a [u8], Range<usize>),
+}
+
+type EvSink<'a> = &'a mut dyn FnMut(Ev<'_>) -> Result<ControlFlow<()>, Error>;
+
 /// Walks the XML and calls `f(namespace URI, local name, raw value range, top-level)` for each
 /// simple property; `Break` from `f` stops the scan.
 fn scan(data: &[u8], limits: &Limits, budget: &Budget<'_>, f: Sink<'_>) -> Result<(), Error> {
+    scan_events(data, limits, budget, false, &mut |ev| match ev {
+        Ev::Prop(ns, name, span, top) => f(ns, name, span, top),
+        Ev::Start(..) | Ev::Attr(..) => Ok(ControlFlow::Continue(())),
+    })
+}
+
+/// [`scan`], reporting [`Ev`]s; the start tags of property elements and their attributes only
+/// with `tags`.
+fn scan_events(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget<'_>,
+    tags: bool,
+    f: EvSink<'_>,
+) -> Result<(), Error> {
     let mut st = Stacks {
         frames: Vec::new(),
         nss: Vec::new(),
         charged: 0,
     };
-    let r = scan_inner(data, limits, budget, &mut st, f);
+    let r = scan_inner(data, limits, budget, &mut st, tags, f);
     budget.release(st.charged);
     r
 }
@@ -497,7 +759,8 @@ fn scan_inner(
     limits: &Limits,
     budget: &Budget<'_>,
     st: &mut Stacks,
-    f: Sink<'_>,
+    tags: bool,
+    f: EvSink<'_>,
 ) -> Result<(), Error> {
     let mut pos = body_start(data);
     let mut nodes = 0usize;
@@ -553,7 +816,7 @@ fn scan_inner(
             {
                 let ub = data.get(u.clone()).unwrap_or_default();
                 let lb = data.get(l.clone()).unwrap_or_default();
-                if f(ub, lb, fr.text_start..lt, fr.top)?.is_break() {
+                if f(Ev::Prop(ub, lb, fr.text_start..lt, fr.top))?.is_break() {
                     return Ok(());
                 }
             }
@@ -646,7 +909,14 @@ fn scan_inner(
             Role::Other => false,
         };
 
-        if role == Role::Desc {
+        let prop_tag = tags && role == Role::Prop;
+        if prop_tag
+            && let Some(u) = uri_b
+            && f(Ev::Start(u, local))?.is_break()
+        {
+            return Ok(());
+        }
+        if role == Role::Desc || prop_tag {
             for (an, av) in attrs() {
                 let aname = data.get(an).unwrap_or_default();
                 let Some(c) = aname.iter().position(|&c| c == b':') else {
@@ -660,7 +930,16 @@ fn scan_inner(
                     continue;
                 };
                 let ub = data.get(u).unwrap_or_default();
-                if ub != NS_RDF && f(ub, at(aname, c + 1), av, top)?.is_break() {
+                if ub == NS_RDF {
+                    continue;
+                }
+                let name = at(aname, c + 1);
+                let ev = if role == Role::Desc {
+                    Ev::Prop(ub, name, av, top)
+                } else {
+                    Ev::Attr(ub, name, av)
+                };
+                if f(ev)?.is_break() {
                     return Ok(());
                 }
             }

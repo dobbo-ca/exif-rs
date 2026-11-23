@@ -21,7 +21,11 @@ let meta = exif::read(file, &limits, &cancel)?;
 if let Some(exif) = &meta.exif {
     println!("orientation {:?}, taken {:?}", exif.orientation(), exif.capture_time());
 }
-let clean = exif::strip(file, Keep { orientation: true, icc: true }, &limits, &cancel)?;
+// Keep::default() drops the EXIF, XMP and IPTC metadata and keeps the rest: the orientation,
+// the ICC profile, unknown segments and the data after a JPEG's image (an Ultra HDR gain map, a
+// Motion Photo video), with the MPF offsets fixed. Keep::NONE drops all of it (the v1 default).
+let clean = exif::strip(file, Keep::default(), &limits, &cancel)?;
+let bare = exif::strip(file, Keep { orientation: true, ..Keep::NONE }, &limits, &cancel)?;
 ```
 
 ## Resource limits
@@ -57,4 +61,4 @@ Details: [docs/limits.md](docs/limits.md).
 [design](docs/design.md), [parity](docs/parity.md) (ExifTool 13.64 oracle; no speed bar, the bench
 is information only), [limits](docs/limits.md), [threading](docs/threading.md),
 [safety](docs/safety.md), [fuzzing](docs/fuzzing.md), [benchmarks](docs/benchmarks.md),
-[dependencies](docs/dependencies.md), [testing](docs/testing.md).
+[dependencies](docs/dependencies.md), [testing](docs/testing.md), [changelog](docs/changelog.md).
