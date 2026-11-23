@@ -4,7 +4,7 @@ use super::{
     Container, Raw, Walk, Want, capped_copy, exif_body, le16, le32, out_vec, splice_one, xmp_span,
 };
 use crate::budget::Budget;
-use crate::rewrite::{kept_exif, reset_exif_in_place};
+use crate::rewrite::{MIN_EXIF_LEN, kept_exif, reset_exif_in_place};
 use crate::{Error, Keep, Limit, Limits};
 
 /// VP8X flags: ICC profile, alpha, EXIF, XMP.
@@ -181,6 +181,41 @@ fn vp8x_for(kind: &[u8; 4], d: &[u8]) -> Option<[u8; 18]> {
     ])
 }
 
+/// The minimal EXIF block for `keep.orientation`: from the first `EXIF` chunk (an `Exif\0\0`
+/// prefix removed) with a valid IFD0 Orientation, among the chunks within the RIFF size, then
+/// among those after it (read as `strip` reads them with `keep.trailing`), all of which `strip`
+/// drops.
+fn kept_orientation(
+    data: &[u8],
+    limits: &Limits,
+    budget: &Budget,
+) -> Result<Option<[u8; MIN_EXIF_LEN]>, Error> {
+    let mut chunks = Chunks::new(data, limits, budget);
+    let mut past = false;
+    loop {
+        match chunks.step()? {
+            Item::Chunk(c) if c.kind == *b"EXIF" => {
+                let block = capped_copy(
+                    budget,
+                    exif_body(c.data(data)),
+                    limits.max_exif_bytes,
+                    Limit::ExifBytes,
+                )?;
+                if let Some(t) = kept_exif(Some(block), limits, budget)? {
+                    return Ok(Some(t));
+                }
+            }
+            Item::Chunk(_) => {}
+            Item::Done | Item::Trunc if !past => {
+                past = true;
+                chunks.pos = chunks.limit + (chunks.limit & 1);
+                chunks.limit = data.len();
+            }
+            Item::Done | Item::Trunc => return Ok(None),
+        }
+    }
+}
+
 pub(crate) fn strip(
     data: &[u8],
     keep: Keep,
@@ -188,11 +223,7 @@ pub(crate) fn strip(
     budget: &Budget,
 ) -> Result<Vec<u8>, Error> {
     let mut exif = if keep.orientation {
-        kept_exif(
-            extract(data, limits, budget, Want::EXIF)?.exif,
-            limits,
-            budget,
-        )?
+        kept_orientation(data, limits, budget)?
     } else {
         None
     };

@@ -14,7 +14,8 @@ use crate::{ByteOrder, Error, Exif, Limits};
 /// segment, PNG chunk or WebP chunk, nothing after a JPEG EOI, a PNG IEND or a WebP RIFF size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keep {
-    /// Keep the EXIF IFD0 Orientation, in a new minimal EXIF block (nothing else of the EXIF).
+    /// Keep the EXIF IFD0 Orientation, in a new minimal EXIF block (nothing else of the EXIF),
+    /// from the first EXIF block `strip` drops that has a valid one.
     pub orientation: bool,
     /// Keep the ICC profile, as stored.
     pub icc: bool,
@@ -103,8 +104,12 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 ///   `XMP\0` chunks among them (read as chunks up to the first bytes that are not a whole one).
 ///
 /// With `keep.orientation` the output has a new minimal EXIF block in the source byte order
-/// when the input has an EXIF IFD0 Orientation (in a simple WebP file, whose VP8X chunk is
-/// then added first, only when the bitstream header gives the size).
+/// when an EXIF block that `strip` drops has a valid IFD0 Orientation: the first such block (in
+/// a JPEG an APP1 that `strip` drops as EXIF, the first `Exif\0\0` one read joined as
+/// [`extract`](crate::extract) gives it; in a WebP an `EXIF` chunk within the RIFF size, else
+/// one after it), so also one that [`read`](crate::read) does not report. In a simple WebP file
+/// the VP8X chunk is then added first, only when the bitstream header gives the size; a WebP
+/// whose RIFF data has no VP8X and no VP8 or VP8L gets no minimal EXIF.
 ///
 /// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes, plus the new
 /// XMP packet); a copied EXIF block to `limits.max_exif_bytes` and `limits.max_alloc`; segments

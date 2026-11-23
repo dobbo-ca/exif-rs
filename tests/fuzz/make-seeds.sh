@@ -81,6 +81,12 @@ bytes 3 1 0 2 17 3 17 0 63 0 > "$t/sos"
   bytes 0 0 255 217
 } > "$out/jpeg/full.jpg"
 { bytes 255 216; seg 225 "$t/exif.be"; bytes 255 217; } > "$out/jpeg/exif-be.jpg"
+# EXIF APP1s that extract does not take but strip drops, and keeps the orientation of:
+# `EXIF\0\0` and `xxExif\0\0`.
+{ printf 'EXIF\000\000'; cat "$t/be.tiff"; } > "$t/exif.upper"
+{ printf 'xxExif\000\000'; cat "$t/le.tiff"; } > "$t/exif.xx"
+{ bytes 255 216; seg 225 "$t/exif.upper"; seg 192 "$t/sof"; seg 218 "$t/sos"; bytes 0 0 255 217; } > "$out/jpeg/exif-upper.jpg"
+{ bytes 255 216; seg 224 "$t/jfif"; seg 225 "$t/exif.xx"; seg 192 "$t/sof"; seg 218 "$t/sos"; bytes 0 0 255 217; } > "$out/jpeg/exif-prefixed.jpg"
 head -c 60 "$out/jpeg/full.jpg" > "$out/jpeg/cut.jpg"
 # A thumbnail that ends past the APP1 block, which read() takes from the file (as ExifTool does):
 # IFD0 with no entries, IFD1 at 14 with offset 44 and length 200, then a 256-byte COM segment.
@@ -162,6 +168,8 @@ head -c 40 "$out/webp/full.webp" > "$out/webp/cut.webp"
 # full.webp with a RIFF size that ends after VP8L (EXIF, XMP and a trailer past it), and with 0.
 { printf 'RIFF'; le32 36; tail -c +9 "$out/webp/full.webp"; printf 'TRAILER'; } > "$out/webp/short-riff.webp"
 { printf 'RIFF'; le32 0; tail -c +9 "$out/webp/full.webp"; } > "$out/webp/zero-riff.webp"
+# A simple file (VP8L only), then past its RIFF size an EXIF chunk with an `Exif\0\0` prefix.
+{ rchunk VP8L "$t/vp8l" | riff; rchunk EXIF "$t/exif.be"; } > "$out/webp/exif-past-riff.webp"
 
 # ---- read: every container seed. strip: [selector][file]: 0 strips all, 3 keeps orientation and
 # ICC, 7 resets the orientation, 43 keeps all but the MPF images, 59 keeps all (Keep::default()).
