@@ -248,7 +248,9 @@ gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway
   end with the bytes after the original's primary image (its EOI found as exif-rs finds it).
   A PNG output must have no `eXIf`, `zxIf`, `zXIf`, `tIME`, `tEXt`, `zTXt` or `iTXt` chunk
   (but a `Raw profile type icc` / `icm` text chunk), and a WebP output no `EXIF`, `XMP ` or
-  `XMP\0` chunk; other unknown chunks may remain.
+  `XMP\0` chunk; other unknown chunks may remain. One `eXIf` / `EXIF` chunk is allowed when the
+  output has `IFD0:Orientation` (the new minimal EXIF block; the tag check above makes sure it
+  holds nothing else).
 - **orient1** (`reset_orientation`): every key equal to the original's except the `System`
   group (file name, size, dates) and `IFD0:Orientation` and `XMP-tiff:Orientation`, which are
   `1` when the original has them and absent when it does not.

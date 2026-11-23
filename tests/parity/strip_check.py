@@ -212,8 +212,9 @@ ICC_KEYWORDS = {b"Raw profile type icc", b"Raw profile type icm"}
 RIFF_META = {b"EXIF", b"XMP ", b"XMP\0"}
 
 
-def check_meta_chunks(out_path, kind):
-    """Mode default: the PNG or WebP output has no metadata chunk left."""
+def check_meta_chunks(out_path, kind, out):
+    """Mode default: the PNG or WebP output has no metadata chunk left but one new EXIF chunk
+    (`eXIf` / `EXIF`) when it has IFD0:Orientation (check_default checks it holds only that)."""
     with open(out_path, "rb") as f:
         d = f.read()
     left = []
@@ -234,6 +235,10 @@ def check_meta_chunks(out_path, kind):
             if t in RIFF_META:
                 left.append(t)
             i += 8 + n + (n & 1)
+    if "IFD0:Orientation" in out:
+        for t in (b"eXIf", b"EXIF"):
+            if t in left:
+                left.remove(t)
     return [f"{t.decode('latin-1')!r} chunk remains" for t in left]
 
 
@@ -328,7 +333,7 @@ def main():
             if mode == "default" and kind == "JPEG":
                 fails += check_trailing(os.path.join(in_dir, name), os.path.join(out_dir, name))
             elif mode == "default" and kind in ("PNG", "WebP"):
-                fails += check_meta_chunks(os.path.join(out_dir, name), kind)
+                fails += check_meta_chunks(os.path.join(out_dir, name), kind, out.get(name, {}))
             if name not in out:
                 fails.append("no ExifTool output")
             if fails:
