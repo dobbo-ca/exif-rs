@@ -7,6 +7,7 @@ use crate::budget::Budget;
 use crate::{Error, Limit, Limits};
 
 pub(crate) mod jpeg;
+pub(crate) mod mpf;
 pub(crate) mod png;
 pub(crate) mod webp;
 

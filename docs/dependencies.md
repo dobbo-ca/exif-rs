@@ -20,5 +20,10 @@ with the `dobbo-ca-ci-read` GitHub App token (`repositories: deflate-rs`), as in
   copied (it is GPL/Artistic).
 - Python 3 with Pillow: the strip pixel check, which decodes the original and the stripped file and
   compares the pixels.
+- libultrahdr (github.com/google/libultrahdr, release v2.0.2, commit `e5f5a022`; Apache-2.0 and
+  MIT): `ultrahdr_app`, built in its own stage of `.github/ci/Dockerfile` with
+  `UHDR_WRITE_XMP=1` and copied into the parity stage. It makes the Ultra HDR test files and
+  decodes the stripped ones (tests/parity/gainmap.py). No code of it is copied, so NOTICE does
+  not list it.
 
 None of these is needed to build or use the crate.

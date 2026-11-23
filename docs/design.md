@@ -136,8 +136,10 @@ pub(crate) fn orientation_value_span(packet: &[u8], limits: &Limits, budget: &Bu
 // max_xmp_bytes, max_xmp_nodes, max_alloc and cancel apply
 
 // src/rewrite.rs
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Keep { pub orientation: bool, pub icc: bool }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keep { pub orientation: bool, pub icc: bool, pub unknown: bool, pub mpf_images: bool, pub trailing: bool }
+impl Keep { pub const NONE: Keep; }        // all false: the v1 Keep::default()
+impl Default for Keep { /* all true */ }   // keep everything that is not the metadata strip is for
 pub fn strip(data: &[u8], keep: Keep, limits: &Limits, cancel: &AtomicBool) -> Result<Vec<u8>, Error>;
 pub fn reset_orientation(data: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Vec<u8>, Error>;
 ```
@@ -204,18 +206,67 @@ bug).
 
 ## Strip and rewrite
 
-`strip` removes all metadata. `Keep.orientation` keeps the EXIF IFD0 Orientation (only it: a new
-minimal EXIF block in the source byte order: TIFF header, IFD0 with one SHORT entry 0x0112, next
-IFD 0). `Keep.icc` keeps the ICC profile bytes as stored. The image data bytes are never changed.
+As a library, strip keeps data by default and drops it only when asked (owner decision
+2026-11-19, the "Metadata rule"). `strip` always removes the metadata it is named for: the EXIF
+block, the XMP packet (standard and extended), IPTC / Photoshop (JPEG APP13) and comments.
+`Keep` says what else stays; `Keep::default()` keeps all of it, `Keep::NONE` none (the v1
+default, which dropped ICC and orientation too). `Keep.orientation` keeps the EXIF IFD0
+Orientation (only it: a new minimal EXIF block in the source byte order: TIFF header, IFD0 with
+one SHORT entry 0x0112, next IFD 0). `Keep.icc` keeps the ICC profile bytes as stored.
+`Keep.unknown` keeps the JPEG APPn segments that are not known metadata. `Keep.trailing` keeps
+the bytes after the JPEG EOI, and `Keep.mpf_images` (with it) the MPF images among them. The
+image data bytes are never changed. PNG and WebP ignore `unknown`, `mpf_images` and `trailing`
+for now (they drop unlisted chunks as before; their wiring comes next).
 
-- **JPEG**: before the first SOS keep SOI, APP0 `JFIF\0`, APP14 `Adobe`, APP2 `ICC_PROFILE` (only
-  with `keep.icc`) and every non-APPn, non-COM marker segment (DQT, DHT, SOFn, DRI, ...). An APP0
-  JFIF segment is kept byte for byte, with the uncompressed RGB thumbnail JFIF 1.02 allows in it,
-  if there is one (image data, not metadata, which ExifTool does not report either). Drop all
-  other APPn and COM. The minimal EXIF APP1 goes right after SOI, or after APP0 JFIF when that is
-  the first segment. From the first SOS up to and including EOI the bytes are copied as they are
-  (segments between scans included). Bytes after EOI (MPF images, trailers) are dropped. No EOI:
+- **JPEG**: always dropped before the first SOS: APP1 EXIF (`Exif\0` in any case after at most
+  4 bytes, as ExifTool finds it, continuation segments included), APP1 XMP (standard, extended,
+  any other `http` or `XMP\0` header, or `<exif:` / `<?xpacket` in the data, which ExifTool also
+  reads as XMP), APP13 `Photoshop 3.0\0` and `Adobe_Photoshop2.5:`, and COM. Always kept: SOI,
+  APP0 `JFIF\0` byte for byte (with the uncompressed RGB thumbnail JFIF 1.02 allows in it, if
+  there is one: image data, not metadata, which ExifTool does not report either), APP14 `Adobe`
+  and every non-APPn, non-COM marker segment (DQT, DHT, SOFn, DRI, ...). APP2 `ICC_PROFILE` with
+  `keep.icc`; APP2 `MPF\0` with `keep.mpf_images` and `keep.trailing`; every other APPn (APP0
+  that is not JFIF, other APP1, APP2 FlashPix or ISO 21496-1, APP3 to APP15 but Photoshop and
+  Adobe) with `keep.unknown`, as stored and in place. The minimal EXIF APP1 goes right after SOI,
+  or after APP0 JFIF when that is the first segment; the new XMP packet (below) right after it.
+  From the first SOS up to and including the EOI of the primary image the bytes are copied as
+  they are (segments between scans included; that EOI is found as `scan_end` finds it). No EOI:
   copy to the end.
+- **JPEG after the EOI** (`keep.trailing`): the bytes are copied as they are, except, without
+  `keep.mpf_images`, the MPF images: the entries after the first of the first APP2 `MPF\0` of the
+  header whose range (the TIFF header after `MPF\0` plus the offset, the size) lies after the
+  EOI, starts with `FF D8` and overlaps no other such range. Without `keep.trailing` nothing
+  after the EOI stays, the MPF segment and the new XMP packet neither.
+- **MPF fix-up** (src/container/mpf.rs): the rewrite records where each run of copied input
+  bytes went (an offset map charged to the budget, a few entries per kept segment). In the
+  output copy of the first kept MPF segment, in its own byte order, the MP Entry tag (0xB002,
+  UNDEFINED, 16 bytes per entry, value inside the segment) is found in IFD0; entry 0 and every
+  entry with offset 0 (the primary image) get the size of the output primary image (SOI to EOI),
+  every other entry the offset of its image's first byte in the output, relative to the output
+  TIFF header. A value that does not fit `u32`, an image the map does not map, and a bad count or
+  type leave the entry or the segment as stored. Every read is bounds-checked.
+- **Container description**: a Motion Photo needs the primary XMP to find its video, and Ultra
+  HDR has `hdrgm:Version` and `Container:Directory` in the primary. When bytes after the EOI are
+  kept and the standard XMP packet has `hdrgm:Version`
+  (`http://ns.adobe.com/hdr-gain-map/1.0/`), Camera fields (`MotionPhoto`, `MotionPhotoVersion`,
+  `MotionPhotoPresentationTimestampUs`, `MicroVideo`, `MicroVideoVersion`, `MicroVideoOffset`,
+  `MicroVideoPresentationTimestampUs` of `http://ns.google.com/photos/1.0/camera/`) or directory
+  items (`Container:Item` of `http://ns.google.com/photos/1.0/container/`, fields `Mime`,
+  `Semantic`, `Length`, `Padding`, `Label`, `URI` of `.../container/item/`, as attributes of the
+  item or simple properties inside it), strip writes one new XMP APP1 packet with only those
+  (top level, the first of each; items in source order). The source is matched by namespace URI,
+  never by prefix; the output uses the prefixes hdrgm, Camera, Container and Item, all fields as
+  attributes, values decoded and escaped again. The scan is the XML scanner of src/xmp.rs (same
+  node limits, budget charge and cancel checks), with the start tags of property elements and
+  their attributes reported too. Item lengths stay true, as the bytes after the EOI are copied
+  as they are. When MPF images were dropped, `hdrgm:Version` is left out and so are the items
+  that were those images: items after the first are located as readers do, from the end of the
+  file, each `Item:Length` bytes followed by its `Item:Padding` bytes, and the first item's
+  padding must lead from the primary EOI to the second item; when that layout does not hold, an
+  item after the first has no number for its length, a dropped image is not exactly one item, or
+  a dropped item has padding, the packet has no directory at all. No packet when nothing is left
+  or the APP1 length would not fit 16 bits. The packet is charged to the budget and the output
+  buffer reserves room for it.
 - **PNG**: keep IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST,
   pHYs, sPLT, acTL, fcTL, fdAT, and with `keep.icc` iCCP and the `Raw profile type icc` / `icm`
   text chunks, verbatim. Drop all other chunks. The
@@ -234,3 +285,10 @@ size, pad and RIFF size are updated). A chunk none of whose bytes change keeps i
 No orientation anywhere: the output equals the input. The XMP scan is charged to the call's
 budget, checks its cancel flag, and its limits are errors as in `read`. Not rewritten:
 compressed XMP and the hex text of PNG raw profiles (EXIF or XMP).
+
+A JPEG keeps every byte, those after the EOI too. When the XMP value changes length (`" 6"`
+becomes `1`, the bytes after it move by `1 - len`), the first APP2 `MPF\0` of the header is fixed
+as in strip, with an offset map of the two runs around the value: the offsets of the images
+after it, and the primary size. When the length does not change the MPF segment is left as
+stored (so a file whose primary size uses another bookkeeping, as some Apple files do, is not
+touched).

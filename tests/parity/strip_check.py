@@ -3,14 +3,16 @@
 
 usage: strip_check.py <in-dir> <exiftool.json> <strip-dir> <report-dir>
 
-<strip-dir>/<mode>/ holds the outputs of mode all, keep and orient1, <strip-dir>/<mode>.json
-ExifTool's JSON of them and <strip-dir>/<mode>.errors the files exif-rs refused. Writes
-<report-dir>/strip.md and <report-dir>/strip-failures.tsv. Exits 1 on any failure: a check of an
-output, or a refusal of a JPEG/PNG/WebP input that strip-refusals.tsv does not list.
+<strip-dir>/<mode>/ holds the outputs of modes all, keep, default and orient1,
+<strip-dir>/<mode>.json ExifTool's JSON of them and <strip-dir>/<mode>.errors the files exif-rs
+refused. Writes <report-dir>/strip.md and <report-dir>/strip-failures.tsv. Exits 1 on any
+failure: a check of an output, or a refusal of a JPEG/PNG/WebP input that strip-refusals.tsv
+does not list.
 """
 
 import hashlib
 import os
+import re
 import sys
 import warnings
 from collections import Counter
@@ -19,7 +21,7 @@ from PIL import Image
 
 from compare import Num, canon, container, load_json, by_name, counts
 
-MODES = ("all", "keep", "orient1")
+MODES = ("all", "keep", "default", "orient1")
 REFUSALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strip-refusals.tsv")
 
 # Tags a fully stripped file may still have: file facts and image structure, no metadata.
@@ -107,13 +109,119 @@ def check_orient1(orig, out):
     return fails
 
 
-CHECKS = {"all": check_all, "keep": check_keep, "orient1": check_orient1}
+# Mode default: the groups of the EXIF block and the Photoshop block, which strip always removes
+# (only IFD0:Orientation may stay), and the container XMP keys it writes again.
+STRIPPED_GROUPS = {"IFD0", "IFD1", "ExifIFD", "GPS", "InteropIFD", "MakerNotes", "Photoshop"}
+GCAMERA = {
+    "MotionPhoto", "MotionPhotoVersion", "MotionPhotoPresentationTimestampUs", "MicroVideo",
+    "MicroVideoVersion", "MicroVideoOffset", "MicroVideoPresentationTimestampUs",
+}
+# MPF values that a strip changes: the image offsets and the size of the primary image.
+MPF_MOVES = re.compile(r"^MPImage\d+:(MPImageStart|MPImageLength)$")
+
+
+def is_container_xmp(key):
+    group, _, tag = key.partition(":")
+    return (
+        key == "XMP-hdrgm:Version"
+        or group == "XMP-GContainer"
+        or (group == "XMP-GCamera" and tag in GCAMERA)
+    )
+
+
+def check_default(orig, out):
+    """As keep, and every other key must be the original's with its value (kept unknown APPn
+    segments, MPF, trailers), except the MPF offsets and sizes; no EXIF, Photoshop or XMP key
+    but IFD0:Orientation and the container XMP keys."""
+    fails = []
+    for k in keys(out):
+        group = k.partition(":")[0]
+        # XMP-rdf:About: the new packet has rdf:about="".
+        kept = ("IFD0:Orientation", "File:ExifByteOrder", "XMP-rdf:About")
+        if allowed(k) or is_icc(k) or k in kept:
+            continue
+        if group in STRIPPED_GROUPS or group.startswith("SubIFD") or (
+            group.startswith("XMP") and not is_container_xmp(k)
+        ):
+            fails.append(f"{k} remains")
+        elif k not in orig:
+            fails.append(f"{k} added")
+        elif not MPF_MOVES.match(k) and canon(orig[k]) != canon(out[k]):
+            fails.append(f"{k}: original {canon(orig[k])} output {canon(out[k])}"[:300])
+    for k in ["IFD0:Orientation"] + sorted(k for k in set(orig) | set(out) if is_icc(k)):
+        if canon(orig.get(k)) != canon(out.get(k)):
+            fails.append(f"{k}: original {canon(orig.get(k))} output {canon(out.get(k))}"[:300])
+    if "File:ExifByteOrder" in out and "IFD0:Orientation" not in out:
+        fails.append("File:ExifByteOrder without IFD0:Orientation")
+    return fails + check_file(orig, out)
+
+
+def primary_end(d):
+    """The offset after the EOI of the primary image of JPEG bytes `d`, found as exif-rs finds
+    it: the segments by their length up to the first SOS, then the scan up to FF D9 (segments
+    between scans skipped by their length); len(d) when there is no EOI; None when a byte before
+    the first scan is not a marker."""
+    n, i = len(d), 2
+    while True:
+        start = i
+        if i >= n or d[i] != 0xFF:
+            return None
+        while i < n and d[i] == 0xFF:
+            i += 1
+        if i >= n:
+            return None
+        m = d[i]
+        i += 1
+        if m == 0xD9:
+            return i
+        if m == 0xDA:
+            i = start
+            break
+        if m == 0x01 or 0xD0 <= m <= 0xD8:
+            continue
+        if m == 0x00 or i + 2 > n:
+            return None
+        length = d[i] << 8 | d[i + 1]
+        if length < 2 or i + length > n:
+            return None
+        i += length
+    while True:
+        j = d.find(b"\xff", i)
+        if j < 0 or j + 1 >= n:
+            return n
+        m = d[j + 1]
+        if m in (0x00, 0x01, 0xFF) or 0xD0 <= m <= 0xD8:
+            i = j + 1
+        elif m == 0xD9:
+            return j + 2
+        elif j + 4 > n:
+            return n
+        else:
+            i = j + 2 + max(d[j + 2] << 8 | d[j + 3], 2)
+
+
+def check_trailing(in_path, out_path):
+    """Mode default: the output ends with the bytes after the original's primary image."""
+    with open(in_path, "rb") as f:
+        d = f.read()
+    end = primary_end(d)
+    if end is None:
+        return []
+    with open(out_path, "rb") as f:
+        if not f.read().endswith(d[end:]):
+            return [f"the {len(d) - end} bytes after the EOI are not kept"]
+    return []
+
+
+CHECKS = {
+    "all": check_all, "keep": check_keep, "default": check_default, "orient1": check_orient1,
+}
 
 
 def frames(path):
     """Mode, size and pixel hash of every frame. JPEG: the first frame only. Pillow opens a
-    JPEG with an MPF segment as MPO, whose later frames are the images after EOI, which strip
-    drops by design (docs/design.md)."""
+    JPEG with an MPF segment as MPO, whose later frames are the images after EOI (modes all and
+    keep drop them; mode default keeps them, checked by check_trailing and gainmap.py)."""
     with Image.open(path) as im:
         out = []
         n = 1 if im.format in ("JPEG", "MPO") else getattr(im, "n_frames", 1)
@@ -179,6 +287,8 @@ def main():
         for name in names:
             c["outputs"] += 1
             fails = CHECKS[mode](orig.get(name, {}), out.get(name, {}))
+            if mode == "default" and container(os.path.join(in_dir, name)) == "JPEG":
+                fails += check_trailing(os.path.join(in_dir, name), os.path.join(out_dir, name))
             if name not in out:
                 fails.append("no ExifTool output")
             if fails:

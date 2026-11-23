@@ -5,10 +5,10 @@
 //! (not every accessor: `Exif::get`/`entries` and `Xmp::orientation` are not called), keyed and
 //! formatted as `exiftool -j -n -G1 -a -b` prints it, or `{"SourceFile":<name>,"Error":<class>}`.
 //!
-//! `oracle strip <all|keep|orient1> <in-dir> <out-dir>` writes `<out-dir>/<name>` for every file
-//! that `strip` (`all`: `Keep::default()`, `keep`: orientation and ICC kept) or
-//! `reset_orientation` (`orient1`) accepts, and one `<name>\t<class>` line per error to
-//! `<out-dir>.errors`.
+//! `oracle strip <all|keep|default|orient1> <in-dir> <out-dir>` writes `<out-dir>/<name>` for
+//! every file that `strip` (`all`: `Keep::NONE`, `keep`: orientation and ICC kept, `default`:
+//! `Keep::default()`) or `reset_orientation` (`orient1`) accepts, and one `<name>\t<class>` line
+//! per error to `<out-dir>.errors`.
 //!
 //! The ExifTool value rules below are written new from a reading of ExifTool 13.64's behaviour
 //! (docs/parity.md lists each one); no ExifTool code is copied. Output is deterministic and the
@@ -43,12 +43,15 @@ fn main() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["read", dir, out] => read_cmd(Path::new(dir), Path::new(out)),
-        ["strip", mode @ ("all" | "keep" | "orient1"), dir, out] => {
-            strip_cmd(mode, Path::new(dir), out)
-        }
+        [
+            "strip",
+            mode @ ("all" | "keep" | "default" | "orient1"),
+            dir,
+            out,
+        ] => strip_cmd(mode, Path::new(dir), out),
         _ => {
             eprintln!(
-                "usage: oracle read <in-dir> <out.jsonl>\n       oracle strip <all|keep|orient1> <in-dir> <out-dir>"
+                "usage: oracle read <in-dir> <out.jsonl>\n       oracle strip <all|keep|default|orient1> <in-dir> <out-dir>"
             );
             process::exit(2);
         }
@@ -116,16 +119,18 @@ fn strip_cmd(mode: &str, dir: &Path, out: &str) -> io::Result<()> {
     for (name, path) in files(dir)? {
         let data = fs::read(&path)?;
         let result = match mode {
-            "all" => exif::strip(&data, Keep::default(), &limits, &cancel),
+            "all" => exif::strip(&data, Keep::NONE, &limits, &cancel),
             "keep" => exif::strip(
                 &data,
                 Keep {
                     orientation: true,
                     icc: true,
+                    ..Keep::NONE
                 },
                 &limits,
                 &cancel,
             ),
+            "default" => exif::strip(&data, Keep::default(), &limits, &cancel),
             _ => exif::reset_orientation(&data, &limits, &cancel),
         };
         match result {

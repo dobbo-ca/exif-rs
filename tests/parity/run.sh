@@ -16,6 +16,7 @@ missing() { echo "run.sh: missing $1" >&2; exit 2; }
 command -v perl >/dev/null 2>&1 || missing perl
 command -v python3 >/dev/null 2>&1 || missing python3
 python3 -c 'import PIL.Image' 2>/dev/null || missing "python3 Pillow (PIL)"
+command -v ultrahdr_app >/dev/null 2>&1 || missing ultrahdr_app
 [ -f "$exiftool" ] || missing "$exiftool"
 [ -x "$oracle" ] || missing "$oracle"
 
@@ -60,7 +61,7 @@ orc = [json.loads(l) for l in open(sys.argv[3], encoding="utf-8") if json.loads(
 json.dump({"exiftool": et, "oracle": orc}, open(sys.argv[4], "w", encoding="utf-8"), indent=1)
 ' "$report/read-mismatches.tsv" "$work/exiftool.json" "$work/oracle.jsonl" "$report/mismatch-records.json" || true
 
-for mode in all keep orient1; do
+for mode in all keep default orient1; do
   "$oracle" strip "$mode" "$work/in" "$work/strip/$mode" || { echo "run.sh: oracle strip $mode failed" >&2; status=1; }
   if [ -n "$(ls -A "$work/strip/$mode" 2>/dev/null)" ]; then
     et "$work/strip/$mode" > "$work/strip/$mode.json" 2>> "$work/exiftool.stderr"
@@ -70,6 +71,8 @@ for mode in all keep orient1; do
   cp "$work/strip/$mode.errors" "$report/strip-$mode.errors" 2>/dev/null || true
 done
 python3 "$here/strip_check.py" "$work/in" "$work/exiftool.json" "$work/strip" "$report" || status=1
+# Ultra HDR and Motion Photo files made in CI (no licensed sample exists), stripped and checked.
+python3 "$here/gainmap.py" "$exiftool" "$oracle" "$work/gainmap" "$report" || status=1
 cp "$work/exiftool.stderr" "$report/exiftool.stderr"
 
 commit() { git -C "$corpus/$1" rev-parse HEAD 2>/dev/null || echo unknown; }
@@ -83,6 +86,8 @@ commit() { git -C "$corpus/$1" rev-parse HEAD 2>/dev/null || echo unknown; }
   cat "$report/compare.md" 2>/dev/null
   echo
   cat "$report/strip.md" 2>/dev/null
+  echo
+  cat "$report/gainmap.md" 2>/dev/null
 } > "$report/summary.md"
 echo "$status" > "$report/status"
 cat "$report/summary.md"

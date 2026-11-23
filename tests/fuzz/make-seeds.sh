@@ -6,7 +6,7 @@
 #   xmp    [selector byte][packet], see fuzz_targets/xmp.rs
 #   jpeg, png, webp   small files with EXIF, XMP and (jpeg, png) more; the image data is a stub
 #   read   all the container seeds
-#   strip  [selector byte][file] for every container seed, three selectors each
+#   strip  [selector byte][file] for every container seed, five selectors each
 set -eu
 out=${1:?usage: make-seeds.sh <out-dir>}
 t=$(mktemp -d)
@@ -94,6 +94,29 @@ head -c 60 "$out/jpeg/full.jpg" > "$out/jpeg/cut.jpg"
 head -c 256 /dev/zero > "$t/com"
 { bytes 255 216; seg 225 "$t/exif.thumb"; seg 254 "$t/com"; bytes 255 217; } > "$out/jpeg/thumb-past-app1.jpg"
 
+# Ultra HDR and Motion Photo shape: a primary with a container XMP packet (hdrgm:Version, Camera
+# fields, a Container:Directory of the primary, the gain map and the video) and an MPF segment
+# (big endian, the primary and the gain map), then the gain map JPEG and a 16-byte fake video.
+{ bytes 255 216; seg 218 "$t/sos"; bytes 0 0 255 217; } > "$t/gm.jpg"
+{ be32 16; printf 'ftypmp42'; be32 0; } > "$t/video"
+gml=$(size "$t/gm.jpg")
+printf '%s' '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/" xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" xmlns:GContainer="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" hdrgm:Version="1.0" GCamera:MotionPhoto="1" GCamera:MotionPhotoVersion="1" tiff:Orientation="6"><GContainer:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><GContainer:Item Item:Semantic="Primary" Item:Mime="image/jpeg" Item:Padding="0"/></rdf:li><rdf:li rdf:parseType="Resource"><GContainer:Item Item:Semantic="GainMap" Item:Mime="image/jpeg" Item:Length="'"$gml"'"/></rdf:li><rdf:li rdf:parseType="Resource"><GContainer:Item Item:Semantic="MotionPhoto" Item:Mime="video/mp4" Item:Length="16"/></rdf:li></rdf:Seq></GContainer:Directory></rdf:Description></rdf:RDF></x:xmpmeta>' > "$t/c.xmp"
+{ printf 'http://ns.adobe.com/xap/1.0/\000'; cat "$t/c.xmp"; } > "$t/cxmp.pay"
+xs=$(($(size "$t/cxmp.pay") + 4))
+p=$((2 + xs + 66 + $(size "$t/sof") + 4 + $(size "$t/sos") + 4 + 4))
+{
+  printf 'MPF\000MM'; bytes 0 42; be32 8
+  bytes 0 1 176 2 0 7; be32 32; be32 26; be32 0
+  be32 196608; be32 "$p"; be32 0; be32 0
+  be32 0; be32 "$gml"; be32 $((p - 2 - xs - 8)); be32 0
+} > "$t/mpf.pay"
+{
+  bytes 255 216
+  seg 225 "$t/cxmp.pay"; seg 226 "$t/mpf.pay"; seg 192 "$t/sof"; seg 218 "$t/sos"
+  bytes 0 0 255 217
+  cat "$t/gm.jpg" "$t/video"
+} > "$out/jpeg/uhdr-motion.jpg"
+
 # ---- PNG: signature, IHDR (1x1 grey), eXIf, iTXt XMP, IDAT (stored zlib block), IEND.
 chunk() { { printf '%s' "$1"; cat "$2"; } > "$t/c"; be32 "$(size "$2")"; cat "$t/c"; be32 "$(crc32 < "$t/c")"; }
 { be32 1; be32 1; bytes 8 0 0 0 0; } > "$t/ihdr"
@@ -127,12 +150,12 @@ bytes 47 0 0 0 0 > "$t/vp8l"
 head -c 40 "$out/webp/full.webp" > "$out/webp/cut.webp"
 
 # ---- read: every container seed. strip: [selector][file]: 0 strips all, 3 keeps orientation and
-# ICC, 7 resets the orientation.
+# ICC, 7 resets the orientation, 43 keeps all but the MPF images, 59 keeps all (Keep::default()).
 for d in jpeg png webp; do
   for f in "$out/$d"/*; do
     n=$d-$(basename "$f")
     cp "$f" "$out/read/$n"
-    for s in 0 3 7; do { bytes "$s"; cat "$f"; } > "$out/strip/$s-$n"; done
+    for s in 0 3 7 43 59; do { bytes "$s"; cat "$f"; } > "$out/strip/$s-$n"; done
   done
 done
 echo "seeds: $(find "$out" -type f | wc -l) files in $out"
