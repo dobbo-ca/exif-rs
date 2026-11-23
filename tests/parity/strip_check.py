@@ -116,8 +116,11 @@ GCAMERA = {
     "MotionPhoto", "MotionPhotoVersion", "MotionPhotoPresentationTimestampUs", "MicroVideo",
     "MicroVideoVersion", "MicroVideoOffset", "MicroVideoPresentationTimestampUs",
 }
-# MPF values that a strip changes: the image offsets and the size of the primary image.
-MPF_MOVES = re.compile(r"^MPImage\d+:(MPImageStart|MPImageLength)$")
+# Values a strip may change: the MPF size of the primary image, every file position ExifTool
+# reports (MPImageStart, a kept maker segment's PreviewImageStart, ...: the bytes move with the
+# dropped segments before them), and Composite values, which it derives in part from the
+# dropped EXIF.
+MOVES = re.compile(r"^MPImage\d+:MPImageLength$|^(?!XMP)[^:]+:\w*(Start|Offset)$|^Composite:")
 
 
 def is_container_xmp(key):
@@ -131,8 +134,8 @@ def is_container_xmp(key):
 
 def check_default(orig, out):
     """As keep, and every other key must be the original's with its value (kept unknown APPn
-    segments, MPF, trailers), except the MPF offsets and sizes; no EXIF, Photoshop or XMP key
-    but IFD0:Orientation and the container XMP keys."""
+    segments, MPF, trailers), except file positions, the MPF primary size and Composite values;
+    no EXIF, Photoshop or XMP key but IFD0:Orientation and the container XMP keys."""
     fails = []
     for k in keys(out):
         group = k.partition(":")[0]
@@ -146,7 +149,7 @@ def check_default(orig, out):
             fails.append(f"{k} remains")
         elif k not in orig:
             fails.append(f"{k} added")
-        elif not MPF_MOVES.match(k) and canon(orig[k]) != canon(out[k]):
+        elif not MOVES.match(k) and canon(orig[k]) != canon(out[k]):
             fails.append(f"{k}: original {canon(orig[k])} output {canon(out[k])}"[:300])
     for k in ["IFD0:Orientation"] + sorted(k for k in set(orig) | set(out) if is_icc(k)):
         if canon(orig.get(k)) != canon(out.get(k)):

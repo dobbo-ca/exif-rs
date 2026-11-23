@@ -240,9 +240,11 @@ gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway
   MakerNotes and Photoshop, and no XMP key but `XMP-hdrgm:Version`, `XMP-GContainer:*` and the
   Motion Photo / MicroVideo keys of `XMP-GCamera` (`XMP-rdf:About` is ignored). Every other key
   (from the unknown APPn segments, the MPF segment, trailers) must be in the original with the
-  same value, except `MPImage<n>:MPImageStart` and `MPImage<n>:MPImageLength`, which move. For
-  a JPEG the output must end with the bytes after the original's primary image (its EOI found as
-  exif-rs finds it).
+  same value, except the values that move with the dropped segments before them: file positions
+  outside XMP (tags ending in `Start` or `Offset`, such as `MPImage<n>:MPImageStart` or the
+  `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` (the primary size), and
+  `Composite:*`, which ExifTool derives in part from the dropped EXIF. For a JPEG the output must
+  end with the bytes after the original's primary image (its EOI found as exif-rs finds it).
 - **orient1** (`reset_orientation`): every key equal to the original's except the `System`
   group (file name, size, dates) and `IFD0:Orientation` and `XMP-tiff:Orientation`, which are
   `1` when the original has them and absent when it does not.
