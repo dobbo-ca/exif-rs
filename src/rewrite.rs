@@ -10,7 +10,8 @@ use crate::{ByteOrder, Error, Exif, Limits};
 ///
 /// [`Keep::default()`] keeps everything that is not the metadata `strip` is for (every field
 /// `true`); [`Keep::NONE`] keeps nothing that can be dropped. The default changed after v1: the v1
-/// default was what `Keep::NONE` is now (no orientation, no ICC profile, nothing after a JPEG EOI).
+/// default was what `Keep::NONE` is now (no orientation, no ICC profile, no unknown JPEG
+/// segment, PNG chunk or WebP chunk, nothing after a JPEG EOI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keep {
     /// Keep the EXIF IFD0 Orientation, in a new minimal EXIF block (nothing else of the EXIF).
@@ -19,8 +20,8 @@ pub struct Keep {
     pub icc: bool,
     /// JPEG: keep the APPn segments that `strip` does not know as metadata, as stored and in
     /// place (for example an ISO 21496-1 gain map APP2, an APP0 that is not JFIF, a FlashPix
-    /// APP2, an APP11 JUMBF box). PNG and WebP ignore this field for now: they drop the chunks
-    /// they do not list.
+    /// APP2, an APP11 JUMBF box); PNG and WebP: the chunks `strip` does not know as metadata or
+    /// image data, as stored and in place (for example a private chunk, a C2PA `caBX`).
     pub unknown: bool,
     /// JPEG: keep the MPF secondary images after the primary image (an Ultra HDR gain map, other
     /// MP images) and the APP2 `MPF` segment, whose offsets are fixed. Needs `trailing`.
@@ -62,8 +63,9 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 /// Removes the EXIF, XMP and IPTC metadata from a JPEG, PNG or WebP file, and with it what
 /// `keep` does not name. The image data bytes are never changed.
 ///
-/// [`Keep::default()`] keeps the orientation, the ICC profile, unknown JPEG segments, the MPF
-/// images and the bytes after the JPEG EOI; [`Keep::NONE`] gives the v1 default output.
+/// [`Keep::default()`] keeps the orientation, the ICC profile, unknown JPEG segments and PNG /
+/// WebP chunks, the MPF images and the bytes after the JPEG EOI; [`Keep::NONE`] gives the v1
+/// default output.
 ///
 /// - JPEG: always drops the EXIF APP1 segments (`Exif\0` within the first bytes, as ExifTool
 ///   finds them), the XMP APP1 segments (standard, extended, and the other headers ExifTool
@@ -83,16 +85,19 @@ pub(crate) const MIN_EXIF_LEN: usize = 26;
 ///   the directory has no item for an image, when MPF images were dropped; when the directory
 ///   items cannot be matched to the dropped images (located from the end of the file by
 ///   `Item:Length` and `Item:Padding`), the packet has no directory.
-/// - PNG: keeps the critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM,
-///   gAMA, sBIT, sRGB, cICP, mDCV, cLLI, bKGD, hIST, pHYs, sPLT, the APNG chunks, iCCP with
-///   `keep.icc`, and with it the `Raw profile type icc` / `icm` text chunks) and drops the
-///   rest.
-/// - WebP: keeps VP8X, VP8, VP8L, ALPH, ANIM, ANMF and ICCP (with `keep.icc`), fixes the VP8X
-///   flags and the RIFF size.
+/// - PNG: always drops `eXIf` (and the once-proposed `zxIf` / `zXIf`), `tIME` and the text
+///   chunks `tEXt`, `zTXt` and `iTXt` (XMP, ImageMagick raw profiles, comments). Keeps the
+///   critical and the rendering chunks (IHDR, PLTE, IDAT, IEND, tRNS, cHRM, gAMA, sBIT, sRGB,
+///   cICP, mDCV, cLLI, bKGD, hIST, pHYs, sPLT, the APNG chunks), iCCP and the `Raw profile type
+///   icc` / `icm` text chunks with `keep.icc`, and every other chunk with `keep.unknown`, as
+///   stored and in place. The new `eXIf` goes right before the first IDAT.
+/// - WebP: always drops `EXIF`, `XMP ` and `XMP\0`. Keeps VP8X, VP8, VP8L, ALPH, ANIM and ANMF,
+///   ICCP with `keep.icc`, and every other chunk with `keep.unknown`, as stored and in place
+///   with its pad byte. Fixes the VP8X flags and the RIFF size.
 ///
 /// With `keep.orientation` the output has a new minimal EXIF block in the source byte order
 /// when the input has an EXIF IFD0 Orientation (in a simple WebP file, whose VP8X chunk is
-/// then added, only when the bitstream header gives the size).
+/// then added first, only when the bitstream header gives the size).
 ///
 /// The output buffer is charged to `limits.max_alloc` (input length plus 64 bytes, plus the new
 /// XMP packet); a copied EXIF block to `limits.max_exif_bytes` and `limits.max_alloc`; segments

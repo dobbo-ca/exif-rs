@@ -134,8 +134,9 @@ def is_container_xmp(key):
 
 def check_default(orig, out):
     """As keep, and every other key must be the original's with its value (kept unknown APPn
-    segments, MPF, trailers), except file positions, the MPF primary size and Composite values;
-    no EXIF, Photoshop or XMP key but IFD0:Orientation and the container XMP keys."""
+    segments and PNG / WebP chunks, MPF, trailers), except file positions, the MPF primary size
+    and Composite values; no EXIF, Photoshop or XMP key but IFD0:Orientation and the container
+    XMP keys."""
     fails = []
     for k in keys(out):
         group = k.partition(":")[0]
@@ -201,6 +202,44 @@ def primary_end(d):
             return n
         else:
             i = j + 2 + max(d[j + 2] << 8 | d[j + 3], 2)
+
+
+# Chunks strip always drops: unknown chunks may remain in mode default, these may not (PNG text
+# only as a `Raw profile type icc` / `icm` chunk, which Keep.icc keeps).
+PNG_META = {b"eXIf", b"zxIf", b"zXIf", b"tIME", b"tEXt", b"zTXt", b"iTXt"}
+PNG_TEXT = {b"tEXt", b"zTXt", b"iTXt"}
+ICC_KEYWORDS = {b"Raw profile type icc", b"Raw profile type icm"}
+RIFF_META = {b"EXIF", b"XMP ", b"XMP\0"}
+
+
+def check_meta_chunks(out_path, kind, out):
+    """Mode default: the PNG or WebP output has no metadata chunk left but one new EXIF chunk
+    (`eXIf` / `EXIF`) when it has IFD0:Orientation (check_default checks it holds only that)."""
+    with open(out_path, "rb") as f:
+        d = f.read()
+    left = []
+    if kind == "PNG":
+        i = 8
+        while i + 8 <= len(d):
+            n, t = int.from_bytes(d[i:i + 4], "big"), d[i + 4:i + 8]
+            icc = t in PNG_TEXT and d[i + 8:i + 8 + n].split(b"\0", 1)[0] in ICC_KEYWORDS
+            if t in PNG_META and not icc:
+                left.append(t)
+            if t == b"IEND":
+                break
+            i += 12 + n
+    else:
+        i = 12
+        while i + 8 <= len(d):
+            t, n = d[i:i + 4], int.from_bytes(d[i + 4:i + 8], "little")
+            if t in RIFF_META:
+                left.append(t)
+            i += 8 + n + (n & 1)
+    if "IFD0:Orientation" in out:
+        for t in (b"eXIf", b"EXIF"):
+            if t in left:
+                left.remove(t)
+    return [f"{t.decode('latin-1')!r} chunk remains" for t in left]
 
 
 def check_trailing(in_path, out_path):
@@ -290,8 +329,11 @@ def main():
         for name in names:
             c["outputs"] += 1
             fails = CHECKS[mode](orig.get(name, {}), out.get(name, {}))
-            if mode == "default" and container(os.path.join(in_dir, name)) == "JPEG":
+            kind = container(os.path.join(in_dir, name))
+            if mode == "default" and kind == "JPEG":
                 fails += check_trailing(os.path.join(in_dir, name), os.path.join(out_dir, name))
+            elif mode == "default" and kind in ("PNG", "WebP"):
+                fails += check_meta_chunks(os.path.join(out_dir, name), kind, out.get(name, {}))
             if name not in out:
                 fails.append("no ExifTool output")
             if fails:

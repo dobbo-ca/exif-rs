@@ -216,8 +216,9 @@ pub(crate) fn strip(
             b"VP8 " | b"VP8L" => {
                 if flags_at.is_none() && exif.is_some() {
                     if let Some(x) = vp8x_for(&c.kind, d) {
-                        flags_at = Some(out.len() + 8);
-                        out.extend_from_slice(&x);
+                        // VP8X is the first chunk, before any kept unknown chunk.
+                        flags_at = Some(12 + 8);
+                        out.splice(12..12, x).for_each(drop);
                     } else {
                         exif = None;
                     }
@@ -228,6 +229,17 @@ pub(crate) fn strip(
             b"ICCP" if keep.icc => {
                 icc_kept = true;
                 push_chunk(&mut out, &c.kind, d);
+            }
+            // Metadata (`XMP\0`: some writers use it, ExifTool reads it as XMP), an ICC profile
+            // that is not kept, a second or short VP8X.
+            b"EXIF" | b"XMP " | b"XMP\0" | b"ICCP" | b"VP8X" => {}
+            // Every other chunk, as stored and in place, with its pad byte (a 0 when the data
+            // ends before it).
+            _ if keep.unknown => {
+                out.extend_from_slice(data.get(c.start..c.end).unwrap_or_default());
+                if (c.end - c.dstart) & 1 == 1 {
+                    out.push(0);
+                }
             }
             _ => {}
         }

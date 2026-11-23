@@ -239,12 +239,18 @@ gets a VP8X chunk becomes Extended WEBP); mode orient1 compares every key anyway
   of the groups IFD0 (but `IFD0:Orientation`), IFD1, ExifIFD, GPS, InteropIFD, SubIFD*,
   MakerNotes and Photoshop, and no XMP key but `XMP-hdrgm:Version`, `XMP-GContainer:*` and the
   Motion Photo / MicroVideo keys of `XMP-GCamera` (`XMP-rdf:About` is ignored). Every other key
-  (from the unknown APPn segments, the MPF segment, trailers) must be in the original with the
+  (from the unknown APPn segments, unknown PNG and WebP chunks, the MPF segment, trailers) must
+  be in the original with the
   same value, except the values that move with the dropped segments before them: file positions
   outside XMP (tags ending in `Start` or `Offset`, such as `MPImage<n>:MPImageStart` or the
   `PreviewImageStart` of a kept Pentax APP7), `MPImage<n>:MPImageLength` (the primary size), and
   `Composite:*`, which ExifTool derives in part from the dropped EXIF. For a JPEG the output must
   end with the bytes after the original's primary image (its EOI found as exif-rs finds it).
+  A PNG output must have no `eXIf`, `zxIf`, `zXIf`, `tIME`, `tEXt`, `zTXt` or `iTXt` chunk
+  (but a `Raw profile type icc` / `icm` text chunk), and a WebP output no `EXIF`, `XMP ` or
+  `XMP\0` chunk; other unknown chunks may remain. One `eXIf` / `EXIF` chunk is allowed when the
+  output has `IFD0:Orientation` (the new minimal EXIF block; the tag check above makes sure it
+  holds nothing else).
 - **orient1** (`reset_orientation`): every key equal to the original's except the `System`
   group (file name, size, dates) and `IFD0:Orientation` and `XMP-tiff:Orientation`, which are
   `1` when the original has them and absent when it does not.

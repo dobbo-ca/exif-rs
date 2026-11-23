@@ -20,8 +20,9 @@
 //!     println!("orientation {:?}, taken {:?}", exif.orientation(), exif.capture_time());
 //! }
 //! // Keep::default() drops the EXIF, XMP and IPTC metadata and keeps the rest: the orientation,
-//! // the ICC profile, unknown segments and the data after a JPEG's image (an Ultra HDR gain map, a
-//! // Motion Photo video), with the MPF offsets fixed. Keep::NONE drops all of it (the v1 default).
+//! // the ICC profile, unknown JPEG segments and PNG / WebP chunks, and the data after a JPEG's
+//! // image (an Ultra HDR gain map, a Motion Photo video), with the MPF offsets fixed. Keep::NONE
+//! // drops all of it (the v1 default).
 //! let clean = exif::strip(file, Keep::default(), &limits, &cancel)?;
 //! let bare = exif::strip(file, Keep { orientation: true, ..Keep::NONE }, &limits, &cancel)?;
 //! # assert_eq!(clean, file);
