@@ -337,6 +337,46 @@ fn png_unknown_chunks_follow_keep_unknown() {
     }
 }
 
+#[test]
+fn png_bytes_after_iend_follow_keep_trailing() {
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 6)]);
+    let tail = [chunk(b"eXIf", &t), b"TRAILER".to_vec()].concat();
+    let mut f = png_with(&[chunk(b"eXIf", &t)]);
+    f.extend_from_slice(&tail);
+    let body = png_with(&[chunk(b"eXIf", &min_exif(false, 6))]);
+    let no_trailing = Keep {
+        trailing: false,
+        ..Keep::default()
+    };
+    let cases = [
+        (Keep::default(), [body.as_slice(), &tail].concat()),
+        (no_trailing, body),
+        (NONE, png_with(&[])),
+    ];
+    for (keep, want) in cases {
+        assert_eq!(run_strip(&f, keep), want, "{keep:?}");
+    }
+    // reset_orientation keeps them too.
+    assert!(run_reset(&f).ends_with(&tail));
+}
+
+#[test]
+fn png_new_exif_goes_before_idot() {
+    let t = tiff(false, &[short(false, 0x0112, 6)]);
+    // Apple's iDOT: the offset of the first IDAT counts from the iDOT chunk.
+    let idot = chunk(
+        b"iDOT",
+        &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x18],
+    );
+    let f = png(&[ihdr(), chunk(b"eXIf", &t), idot.clone(), idat(), iend()]);
+    let min = chunk(b"eXIf", &min_exif(false, 6));
+    // The IDAT still starts right after the iDOT chunk.
+    assert_eq!(
+        run_strip(&f, Keep::default()),
+        png(&[ihdr(), min, idot, idat(), iend()])
+    );
+}
+
 // ---- WebP strip ----
 
 fn full_webp(be: bool) -> Vec<u8> {
@@ -470,6 +510,47 @@ fn webp_unknown_chunk_without_its_pad_byte_gets_one() {
     let out = run_strip(&f, Keep::default());
     assert_eq!(out, want);
     webp_chunks(&out);
+}
+
+#[test]
+fn webp_bytes_after_the_riff_size_follow_keep_trailing() {
+    let t = tiff(false, &[ascii(0x010F, "Canon"), short(false, 0x0112, 6)]);
+    let tail = [riff_chunk(b"EXIF", &t), b"TRAILER!".to_vec()].concat();
+    let f = [
+        webp(&[vp8x(0x08, 16, 8), vp8(), riff_chunk(b"EXIF", &t)]),
+        tail.clone(),
+    ]
+    .concat();
+    let body = webp(&[
+        vp8x(0x08, 16, 8),
+        vp8(),
+        riff_chunk(b"EXIF", &min_exif(false, 6)),
+    ]);
+    let no_trailing = Keep {
+        trailing: false,
+        ..Keep::default()
+    };
+    let cases = [
+        (Keep::default(), [body.as_slice(), &tail].concat()),
+        (no_trailing, body),
+        (NONE, webp(&[vp8x(0x00, 16, 8), vp8()])),
+    ];
+    for (keep, want) in cases {
+        assert_eq!(run_strip(&f, keep), want, "{keep:?}");
+    }
+    assert!(run_reset(&f).ends_with(&tail));
+
+    // A RIFF size without the last pad byte: the pad byte is not part of the trailing bytes.
+    let mut g = webp(&[vp8(), riff_chunk(b"prVt", b"odd")]);
+    let riff = u32::try_from(g.len() - 8 - 1).unwrap();
+    g[4..8].copy_from_slice(&riff.to_le_bytes());
+    g.extend_from_slice(b"TAIL");
+    let want = [
+        webp(&[vp8(), riff_chunk(b"prVt", b"odd")]),
+        b"TAIL".to_vec(),
+    ]
+    .concat();
+    assert_eq!(run_strip(&g, Keep::default()), want);
 }
 
 // ---- reset_orientation ----

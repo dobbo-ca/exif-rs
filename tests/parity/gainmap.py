@@ -8,7 +8,12 @@ deterministically:
   uhdr.jpg         libultrahdr's ultrahdr_app (built with XMP on) from a 64x64 P010 + YUV420
                    gradient: primary with hdrgm:Version, Container:Directory and MPF, gain map
                    after the EOI.
-  uhdr-orient.jpg  uhdr.jpg with an EXIF orientation of 6 written by ExifTool.
+  uhdr-orient.jpg  uhdr.jpg with an EXIF orientation of 6 written by ExifTool, and the MPF
+                   primary size set again (ExifTool does not rewrite MPF).
+  uhdr-mpf-first.jpg  uhdr.jpg with the MPF segment moved first (after SOI, or JFIF) and an XMP
+                   tiff:Orientation " 6" in the primary packet, MPF entries fixed: strip drops and
+                   reset_orientation shortens the XMP after the MPF header, so the gain map's MPF
+                   offset changes.
   motion.jpg       a Pillow JPEG with a Motion Photo XMP packet (Camera:MotionPhoto and a
                    directory) and a fake mp4 (ftyp and mdat boxes) after the EOI.
   uhdr-motion.jpg  uhdr.jpg with that video after the gain map, a directory of the three items
@@ -18,10 +23,10 @@ Then `oracle strip` in modes default, keep and orient1, and per output:
   - Pillow pixels of the primary image equal the input's;
   - default and orient1: the MPImage2 bytes ExifTool extracts equal the input's, so do the bytes
     at MPImageStart/MPImageLength of the output and the Pillow pixels of that gain map;
+    MPImage1 has start 0 and the primary image's size (SOI to EOI) in input and output;
     ultrahdr_app decodes the output to the same raw pixels as the input; MotionPhotoVideo equals
-    the appended video;
-  - default: hdrgm:Version and the directory as in the input; orient1: IFD0:Orientation 1 (when
-    the input has one);
+    the appended video; hdrgm:Version and the directory as in the input;
+  - orient1: IFD0:Orientation and XMP-tiff:Orientation 1 (when the input has them);
   - keep: no MPF image, no video, nothing after the primary image's EOI.
 Writes <report-dir>/gainmap.md; exits 1 when an input cannot be made or a check fails.
 """
@@ -31,6 +36,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import warnings
@@ -164,7 +170,7 @@ def decode(path):
 
 
 def make_inputs(exiftool, work, gen):
-    """The four inputs in `gen`, and what they hold: {name: (gain map bytes, video bytes)}."""
+    """The five inputs in `gen`, and what they hold: {name: (gain map bytes, video bytes)}."""
     raw_inputs(work)
     uhdr = os.path.join(gen, "uhdr.jpg")
     r = run(["ultrahdr_app", "-m", "0", "-p", "hdr.p010", "-y", "sdr.yuv", "-a", "0", "-b", "1",
@@ -178,10 +184,18 @@ def make_inputs(exiftool, work, gen):
     gm = d[end:]
     if not gm.startswith(b"\xff\xd8"):
         raise RuntimeError("uhdr.jpg: no gain map after the primary image")
-    r = run(["perl", exiftool, "-q", "-Orientation#=6", "-o",
-             os.path.join(gen, "uhdr-orient.jpg"), uhdr])
+    orient = os.path.join(gen, "uhdr-orient.jpg")
+    r = run(["perl", exiftool, "-q", "-Orientation#=6", "-o", orient, uhdr])
     if r.returncode != 0:
         raise RuntimeError(f"exiftool -Orientation#=6: {r.stderr.decode('utf-8', 'replace')}")
+    # ExifTool does not rewrite the MPF entries: set the primary size for the new EXIF.
+    with open(orient, "rb") as f:
+        o = f.read()
+    o_end = primary_end(o)
+    primary = bytearray(o[:o_end])
+    fix_mpf(primary)
+    with open(orient, "wb") as f:
+        f.write(primary + o[o_end:])
 
     im = Image.new("RGB", (W, H))
     im.putdata([(4 * c, 4 * r, (r + c) * 2 % 256) for r in range(H) for c in range(W)])
@@ -199,9 +213,27 @@ def make_inputs(exiftool, work, gen):
     fix_mpf(primary)
     with open(os.path.join(gen, "uhdr-motion.jpg"), "wb") as f:
         f.write(primary + gm + VIDEO)
+
+    # The MPF segment first and an XMP tiff:Orientation " 6" after it: strip (which drops the
+    # XMP) and reset_orientation (" 6" becomes "1") move the gain map but not the MPF header.
+    tiff = ' xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Orientation=" 6"'
+    packet, n = re.subn(r"<rdf:Description(?=[\s/>])", lambda _: "<rdf:Description" + tiff,
+                        d[xmp[1] + 4 + len(XMP_SIG):xmp[2]].decode(), count=1)
+    if n != 1:
+        raise RuntimeError("uhdr.jpg: no rdf:Description in the XMP packet")
+    mpf = next(s for s in segs if s[0] == 0xE2 and d[s[1] + 4:s[1] + 8] == b"MPF\x00")
+    jfif = 1 if segs[0][0] == 0xE0 and d[segs[0][1] + 4:segs[0][1] + 9] == b"JFIF\x00" else 0
+    primary = bytearray(b"\xff\xd8")
+    for m, s, e in segs[:jfif] + [mpf] + [x for x in segs[jfif:] if x != mpf]:
+        primary += app1_xmp(packet) if (m, s, e) == xmp else d[s:e]
+    primary += d[segs[-1][2]:end]
+    fix_mpf(primary)
+    with open(os.path.join(gen, "uhdr-mpf-first.jpg"), "wb") as f:
+        f.write(primary + gm)
     return {
         "uhdr.jpg": (gm, b""),
         "uhdr-orient.jpg": (gm, b""),
+        "uhdr-mpf-first.jpg": (gm, b""),
         "motion.jpg": (b"", VIDEO),
         "uhdr-motion.jpg": (gm, VIDEO),
     }
@@ -238,6 +270,11 @@ def check(mode, name, gm, video, in_path, out_path, et_in, et_out, decoded_in):
             isinstance(start, int) and isinstance(length, int) and dout[start:start + length] == gm,
             f"bytes at MPImageStart {start} length {length} are not the gain map",
         )
+        # The primary image's MP Entry: offset 0, size SOI to EOI.
+        for what, et, data in (("input", et_in, din), ("output", et_out, dout)):
+            got = (et.get("MPImage1:MPImageStart"), et.get("MPImage1:MPImageLength"))
+            expect(got == (0, primary_end(data)),
+                   f"{what}: MPImage1 start, length {got}, primary size {primary_end(data)}")
         try:
             same = mp_out is not None and pixels(mp_out) == pixels(gm)
         except Exception as e:  # any decoder error
@@ -251,13 +288,13 @@ def check(mode, name, gm, video, in_path, out_path, et_in, et_out, decoded_in):
     if video:
         expect(vid_out == video, "MotionPhotoVideo differs")
     expect(dout.endswith(gm + video), "bytes after the EOI differ")
-    if mode == "default":
-        for k in ("XMP-hdrgm:Version", "XMP-GContainer:DirectoryItemSemantic",
-                  "XMP-GContainer:DirectoryItemLength", "XMP-GCamera:MotionPhoto"):
-            expect(et_in.get(k) == et_out.get(k), f"{k}: input {et_in.get(k)} output {et_out.get(k)}")
-    else:
-        if "IFD0:Orientation" in et_in:
-            expect(et_out.get("IFD0:Orientation") == 1, "IFD0:Orientation is not 1")
+    for k in ("XMP-hdrgm:Version", "XMP-GContainer:DirectoryItemSemantic",
+              "XMP-GContainer:DirectoryItemLength", "XMP-GCamera:MotionPhoto"):
+        expect(et_in.get(k) == et_out.get(k), f"{k}: input {et_in.get(k)} output {et_out.get(k)}")
+    if mode == "orient1":
+        for k in ("IFD0:Orientation", "XMP-tiff:Orientation"):
+            if k in et_in:
+                expect(et_out.get(k) == 1, f"{k} is not 1")
     return fails, n
 
 

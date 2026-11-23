@@ -208,15 +208,16 @@ bug).
 
 As a library, strip keeps data by default and drops it only when asked (owner decision
 2026-11-19, the "Metadata rule"). `strip` always removes the metadata it is named for: the EXIF
-block, the XMP packet (standard and extended), IPTC / Photoshop (JPEG APP13) and comments.
+block, the XMP packet (standard and extended), IPTC / Photoshop (JPEG APP13), comments and
+text (JPEG COM, PNG `tEXt` / `zTXt` / `iTXt`) and the PNG modification time (`tIME`).
 `Keep` says what else stays; `Keep::default()` keeps all of it, `Keep::NONE` none (the v1
 default, which dropped ICC and orientation too). `Keep.orientation` keeps the EXIF IFD0
 Orientation (only it: a new minimal EXIF block in the source byte order: TIFF header, IFD0 with
 one SHORT entry 0x0112, next IFD 0). `Keep.icc` keeps the ICC profile bytes as stored.
 `Keep.unknown` keeps the JPEG APPn segments and the PNG and WebP chunks that are not known
-metadata or image data. `Keep.trailing` keeps the bytes after the JPEG EOI, and
-`Keep.mpf_images` (with it) the MPF images among them (JPEG only). The image data bytes are
-never changed.
+metadata or image data. `Keep.trailing` keeps the bytes after the image (the JPEG EOI, the PNG
+IEND, the end the WebP RIFF size gives), as stored and not parsed, and `Keep.mpf_images` (with
+it) the MPF images among them (JPEG only). The image data bytes are never changed.
 
 - **JPEG**: always dropped before the first SOS: APP1 EXIF (`Exif\0` in any case after at most
   4 bytes, as ExifTool finds it, continuation segments included), APP1 XMP (standard, extended,
@@ -275,13 +276,17 @@ never changed.
   `oFFs`, `vpAg`, ...). Kept chunks are copied verbatim (CRC as stored) and in their input
   order, so a chunk that had to come before PLTE or IDAT still does. The minimal EXIF goes into
   a new `eXIf` chunk (CRC computed) right before the first IDAT (before IEND when there is no
-  IDAT), where the PNG specification wants it.
+  IDAT), where the PNG specification wants it, or before Apple's `iDOT` when that comes first
+  (iDOT holds the offset of the first IDAT from its own start). With `keep.trailing` the bytes
+  after IEND are copied as they are.
 - **WebP**: always drop `EXIF`, `XMP ` and `XMP\0`. Keep VP8X (the first one with at least 10
   bytes), VP8 , VP8L, ALPH, ANIM, ANMF; ICCP with `keep.icc`; with `keep.unknown` every other
   chunk, verbatim with its pad byte (a 0 is added when the data ends before it), in place.
   Clear the VP8X flags of what was dropped (EXIF 0x08, XMP 0x04, ICC 0x20), set EXIF when the
   minimal EXIF chunk is added (at the end), and write the new RIFF size. A simple file that
-  gets the minimal EXIF gets a VP8X chunk first, before every kept chunk.
+  gets the minimal EXIF gets a VP8X chunk first, before every kept chunk. With `keep.trailing`
+  the bytes after the end the RIFF size gives (and its pad byte, when the size is odd, as
+  ExifTool reads it) follow the new RIFF data, as they are.
 
 `reset_orientation` changes only orientation values to 1, every other byte stays: the first value
 of the EXIF IFD0 Orientation in place (the first entry; none when it is not an integer type), in

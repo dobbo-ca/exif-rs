@@ -255,6 +255,23 @@ def check_trailing(in_path, out_path):
     return []
 
 
+def check_mpf_primary(in_path, out_path, orig, out):
+    """Mode default: when the original's MPImage1:MPImageLength is its primary image's size, the
+    output's is the output primary image's size (MOVES exempts the value from the equality)."""
+    key = "MPImage1:MPImageLength"
+    if key not in orig:
+        return []
+    with open(in_path, "rb") as f:
+        size_in = primary_end(f.read())
+    with open(out_path, "rb") as f:
+        size_out = primary_end(f.read())
+    if canon(orig[key]) != canon(Num(str(size_in))):
+        return []
+    if canon(out.get(key)) != canon(Num(str(size_out))):
+        return [f"{key}: output {canon(out.get(key))}, output primary size {size_out}"]
+    return []
+
+
 CHECKS = {
     "all": check_all, "keep": check_keep, "default": check_default, "orient1": check_orient1,
 }
@@ -332,6 +349,8 @@ def main():
             kind = container(os.path.join(in_dir, name))
             if mode == "default" and kind == "JPEG":
                 fails += check_trailing(os.path.join(in_dir, name), os.path.join(out_dir, name))
+                fails += check_mpf_primary(os.path.join(in_dir, name), os.path.join(out_dir, name),
+                                           orig.get(name, {}), out.get(name, {}))
             elif mode == "default" and kind in ("PNG", "WebP"):
                 fails += check_meta_chunks(os.path.join(out_dir, name), kind, out.get(name, {}))
             if name not in out:

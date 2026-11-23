@@ -462,14 +462,20 @@ pub(crate) fn strip(
     loop {
         match chunks.step()? {
             Item::Chunk(c) => {
-                if c.kind == *b"IDAT" || c.kind == *b"IEND" {
+                // Before Apple's iDOT too: it holds the offset of the first IDAT from itself.
+                if c.kind == *b"iDOT" || c.kind == *b"IDAT" || c.kind == *b"IEND" {
                     put_exif(&mut out, &mut pending);
                 }
                 if keep_chunk(&c.kind, c.data(data), keep) {
                     out.extend_from_slice(data.get(c.start..c.end).unwrap_or_default());
                 }
             }
-            Item::Done => return Ok(out),
+            Item::Done => {
+                if keep.trailing {
+                    out.extend_from_slice(data.get(chunks.pos..).unwrap_or_default());
+                }
+                return Ok(out);
+            }
             Item::Trunc => return Err(Error::Truncated),
             Item::Bad => return Err(Error::Malformed("png chunk length")),
         }
