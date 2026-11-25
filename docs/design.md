@@ -206,7 +206,7 @@ bug).
 
 ## Strip and rewrite
 
-As a library, strip keeps data by default and drops it only when asked (owner decision
+As a library, strip keeps data by default and drops it only when asked (decision
 2026-11-19, the "Metadata rule"). `strip` always removes the metadata it is named for: the EXIF
 block, the XMP packet (standard and extended), IPTC / Photoshop (JPEG APP13), comments and
 text (JPEG COM, PNG `tEXt` / `zTXt` / `iTXt`) and the PNG modification time (`tIME`).

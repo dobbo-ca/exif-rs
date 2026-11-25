@@ -6,7 +6,7 @@
 - No SIMD tier, so no `target_feature` code, no runtime detection, no `<CRATE>_SIMD` override, no
   scalar/SIMD parity tests. A SIMD tier is for crates with hot kernels. This crate
   has none: the work is walking a few hundred IFD entries, a tolerant XML pass over a few KiB, and
-  copying bytes. There is no speed bar (owner decision), the bench is information only
+  copying bytes. There is no speed bar, the bench is information only
   (benchmarks.md), and a kernel would only add `unsafe` surface.
 - Non-test code denies `clippy::unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`
   (`cfg_attr(not(test), deny(...))` in src/lib.rs). CI runs clippy with `-D warnings` on all
