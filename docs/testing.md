@@ -25,10 +25,10 @@ Doc-tests (the crate-level example in `src/lib.rs`) are compiled by `cargo test`
 
 - `test`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the
   aarch64 release build. Runs on pull requests; the only required check.
-- `arm64`: `cargo test` for aarch64 under `qemu-aarch64`. The crate has no SIMD, so this checks the
+- `arm64`: `cargo test` for aarch64 on a native arm64 runner (`ubuntu-24.04-arm`). The crate has no SIMD, so this checks the
   byte-order and arithmetic paths on a second target. Push to `main` and dispatch only.
 - `parity`: ExifTool 13.64 against `examples/oracle.rs` on the same inputs (docs/parity.md).
-- `parity-arm64`: the oracle example under qemu on a subset of the inputs.
+- `parity-arm64`: the oracle example on a native arm64 runner, on a subset of the inputs.
 - `fuzz` (`fuzz.yml`): weekly and dispatch, docs/fuzzing.md.
 - `bench` (`bench.yml`): information only, docs/benchmarks.md.
 

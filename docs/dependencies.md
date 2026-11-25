@@ -8,7 +8,7 @@
 
 Nothing else: no C dependency, no `-sys` crate, no `cc`/`bindgen`, no proc macro, no XML crate (the
 XMP reader is small and tolerant by design, see design.md). CI fetches the private git dependency
-with the `dobbo-ca-ci-read` GitHub App token (`repositories: deflate-rs`), as in conventions.
+with the `dobbo-ca-ci-read` GitHub App token (`repositories: deflate-rs`).
 
 ## Test-only
 

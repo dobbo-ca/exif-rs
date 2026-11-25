@@ -6,14 +6,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  # The checks run inside .github/ci/Dockerfile on the in-cluster BuildKit, so the Rust image and the
-  # build cache stay in the cluster. deflate-rs is private: the dobbo-ca-ci-read GitHub App mints a
-  # read-only token for that repo, and it reaches the build only as a BuildKit secret. The layers are
-  # also saved to the Actions cache (one scope per job), so a restart of buildkitd does not throw
-  # them away.
-  # A PR needs only `test`; arm64, parity and parity-arm64 run on main and on workflow_dispatch.
+  # The checks run inside .github/ci/Dockerfile, built with docker buildx on GitHub-hosted runners:
+  # ubuntu-24.04 for x86_64 and ubuntu-24.04-arm (native, no emulator) for the arm64 jobs.
+  # deflate-rs is private for now: the dobbo-ca-ci-read GitHub App mints a read-only token for that
+  # repo, and it reaches the build only as a BuildKit secret. The layers are saved to the Actions
+  # cache (one scope per job).
+  # A PR needs only `test`; arm64, parity, parity-ref and parity-arm64 run on main and on
+  # workflow_dispatch. A fork PR gets no secrets, so `test` skips there.
   test:
-    runs-on: github-arc-runner-set
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,9 +29,6 @@ jobs:
           repositories: deflate-rs
           permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -44,10 +43,10 @@ jobs:
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
 
-  # The whole suite on aarch64 under qemu-user.
+  # The whole suite on a native aarch64 runner.
   arm64:
     if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,9 +60,6 @@ jobs:
           repositories: deflate-rs
           permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -80,7 +76,7 @@ jobs:
   # compares them. The report is the artifact parity-report; the job fails when its status is not 0.
   parity:
     if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,9 +90,6 @@ jobs:
           repositories: deflate-rs
           permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -118,12 +111,12 @@ jobs:
       - run: |
           s=$(cat parity-out/status)
           [ "$s" = 0 ] || { echo "parity status $s"; exit 1; }
-
-  # The x86_64 and the aarch64 (qemu-user) builds of the oracle example give byte-identical output.
-  parity-arm64:
+  # The x86_64 reference trees of the oracle example (read and strip over every 8th input), for
+  # parity-arm64.
+  parity-ref:
     if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
@@ -136,14 +129,52 @@ jobs:
           repositories: deflate-rs
           permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
+          context: .
+          file: .github/ci/Dockerfile
+          target: x86-ref-out
+          push: false
+          outputs: type=local,dest=parity-ref
+          cache-from: type=gha,scope=exif-rs-parity-ref
+          cache-to: type=gha,mode=max,scope=exif-rs-parity-ref
+          secrets: |
+            gh_token=${{ steps.app.outputs.token }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parity-ref-x86
+          path: parity-ref
+          retention-days: 1
+
+  # The oracle example built natively on an aarch64 runner gives output byte-identical to the
+  # x86_64 trees of parity-ref.
+  parity-arm64:
+    if: github.event_name != 'pull_request'
+    needs: parity-ref
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { lfs: false }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: parity-ref-x86
+          path: ${{ runner.temp }}/x86ref
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_KEY }}
+          owner: dobbo-ca
+          repositories: deflate-rs
+          permission-contents: read
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: .github/ci/Dockerfile
           target: parity-arm64
+          build-contexts: x86ref=${{ runner.temp }}/x86ref
           push: false
           outputs: type=cacheonly
           cache-from: type=gha,scope=exif-rs-parity-arm64
