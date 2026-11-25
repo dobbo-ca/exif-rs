@@ -1,10 +1,10 @@
 # CI image: Rust runs here, built with docker buildx on GitHub-hosted runners (ubuntu-24.04 for
 # x86_64, ubuntu-24.04-arm for the native arm64 stages).
-# The crate depends on dobbo-ca/deflate-rs by git rev; the dobbo-ca-ci-read app token fetches it while
-# that repo is private. Its fetch is the only
-# step that needs the GitHub App token, passed as the BuildKit secret `gh_token` (never a build
-# arg, never written to a layer); every later step runs offline. The fuzz crate's own dependencies
-# (libfuzzer-sys from crates.io) are fetched in the same step.
+# The crate depends on dobbo-ca/deflate-rs by git rev; the dobbo-ca-ci-read app token fetches it
+# while that repo is private. Its fetch is the only step that needs the GitHub App token, passed as
+# the BuildKit secret `gh_token` (never a build arg, never written to a layer); every later step
+# runs offline. The fuzz crate's own dependencies (libfuzzer-sys from crates.io) are fetched in the
+# same step.
 # Every tool is installed in a stage before `COPY . .`, so a new commit does not install it again,
 # and the fetch runs from the manifests and lockfiles alone, so a commit that leaves them alone
 # does not fetch again.
