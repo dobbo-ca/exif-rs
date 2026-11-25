@@ -29,7 +29,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "deflate"
 version = "0.1.0"
-source = "git+https://github.com/dobbo-ca/deflate-rs?rev=617a5404b213cee8e0fdc42974e46d65e0a1b480#617a5404b213cee8e0fdc42974e46d65e0a1b480"
+source = "git+https://github.com/dobbo-ca/deflate-rs?rev=211232f521f4378efd74f224df2fc05213cec94a#211232f521f4378efd74f224df2fc05213cec94a"
 
 [[package]]
 name = "exif"

@@ -9,4 +9,4 @@ publish = false
 
 [dependencies]
 # zlib inflate for PNG zTXt and compressed iTXt chunks (docs/dependencies.md).
-deflate = { git = "https://github.com/dobbo-ca/deflate-rs", rev = "617a5404b213cee8e0fdc42974e46d65e0a1b480" }
+deflate = { git = "https://github.com/dobbo-ca/deflate-rs", rev = "211232f521f4378efd74f224df2fc05213cec94a" }

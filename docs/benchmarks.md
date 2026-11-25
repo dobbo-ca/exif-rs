@@ -1,6 +1,6 @@
 # Benchmarks
 
-There is no speed bar (owner decision): the numbers are information only and never fail a job.
+There is no speed bar: the numbers are information only and never fail a job.
 
 `.github/workflows/bench.yml` (`workflow_dispatch` and push to `main`, not required) builds the CI
 image and, on the parity corpus in one job, times:

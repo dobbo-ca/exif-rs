@@ -1,13 +1,23 @@
-# CI image: Rust runs here, on the in-cluster BuildKit, because the ARC runner has no toolchain.
-# The crate depends on one private dobbo-ca port (deflate-rs) by git rev. Its fetch is the only
-# step that needs the GitHub App token, passed as the BuildKit secret `gh_token` (never a build
-# arg, never written to a layer); every later step runs offline. The fuzz crate's own dependencies
-# (libfuzzer-sys from crates.io) are fetched in the same step.
+# CI image: Rust runs here, built with docker buildx on GitHub-hosted runners (ubuntu-24.04 for
+# x86_64, ubuntu-24.04-arm for the native arm64 stages).
+# The crate depends on dobbo-ca/deflate-rs by git rev; a read-only GitHub App token fetches it
+# while that repo is private. Its fetch is the only step that needs the GitHub App token, passed as
+# the BuildKit secret `gh_token` (never a build arg, never written to a layer); every later step
+# runs offline. The fuzz crate's own dependencies (libfuzzer-sys from crates.io) are fetched in the
+# same step.
 # Every tool is installed in a stage before `COPY . .`, so a new commit does not install it again,
 # and the fetch runs from the manifests and lockfiles alone, so a commit that leaves them alone
 # does not fetch again.
 FROM rust:1.99.1-bookworm AS toolchain
-RUN rustup component add rustfmt clippy && rustup target add aarch64-unknown-linux-gnu
+ARG TARGETARCH
+# On x86_64, gcc-aarch64-linux-gnu is the linker of `cargo build --target aarch64-unknown-linux-gnu`
+# (the aarch64 lint and link check in `ci`). On arm64 that target is the host: no cross toolchain.
+RUN rustup component add rustfmt clippy && rustup target add aarch64-unknown-linux-gnu \
+    && if [ "$TARGETARCH" = amd64 ]; then \
+         apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+         && rm -rf /var/lib/apt/lists/* \
+         && printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> "$CARGO_HOME/config.toml"; \
+       fi
 WORKDIR /src
 
 # Only the manifests, with empty targets for what they name, so cargo can resolve them.
@@ -46,23 +56,17 @@ RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
 RUN --mount=type=cache,id=exif-fuzz-target,target=/src/tests/fuzz/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cd tests/fuzz && cargo check --locked --bins
 
-# qemu-user and the aarch64 cross toolchain, for the arm64 stages.
-FROM toolchain AS qemu-tools
-RUN apt-get update && apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
-    && rm -rf /var/lib/apt/lists/*
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
-
-FROM qemu-tools AS qemu-arm64
+# The arm64 stages are built natively on an arm64 runner (ubuntu-24.04-arm): no emulator.
+FROM toolchain AS native-arm64
 COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
 COPY . .
 
-# The whole suite runs on aarch64 under qemu-user, released: the crate is small and has no SIMD, so
+# The whole suite runs on aarch64, released: the crate is small and has no SIMD, so
 # there are no kernel-only tests to select (what the target changes is deflate-rs's NEON adler32,
 # which every PNG text inflate runs).
-FROM qemu-arm64 AS arm64
+FROM native-arm64 AS arm64
 RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --release --target aarch64-unknown-linux-gnu
 
@@ -114,10 +118,9 @@ RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
 FROM scratch AS parity-report
 COPY --from=parity /report /
 
-# The same oracle example built for x86_64 and for aarch64 (run under qemu-user) reads every 8th
-# input and strips it in all four modes; the outputs must be byte-identical. Outputs are deleted
-# at the end of the RUN, so the layer stays small.
-FROM qemu-tools AS parity-arm64
+# The oracle example built for x86_64 reads every 8th input and strips it in all four modes; the
+# outputs are the reference trees for parity-arm64.
+FROM toolchain AS x86-ref
 COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY --from=deps /usr/local/cargo/git /usr/local/cargo/git
 ENV CARGO_NET_OFFLINE=true
@@ -126,18 +129,39 @@ RUN --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
     --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
     find src examples tests -name '*.rs' -exec touch {} + \
     && sh tests/parity/fetch.sh /corpus \
-    && mkdir -p /work /out \
+    && mkdir -p /work /ref \
     && sh tests/parity/inputs.sh /corpus /work/in 8 \
     && echo "$(ls /work/in | wc -l) inputs" \
     && cargo build --locked --release --example oracle \
+    && x=target/release/examples/oracle \
+    && $x read /work/in /ref/x.jsonl \
+    && for m in all keep default orient1; do $x strip $m /work/in /ref/x-$m || exit 1; done
+
+# The x86_64 reference trees as a build output (job parity-ref uploads them for parity-arm64).
+FROM scratch AS x86-ref-out
+COPY --from=x86-ref /ref /
+
+# The same oracle example built natively for aarch64 reads the same inputs and strips them in all
+# four modes; the outputs must be byte-identical to the x86_64 trees of `x86-ref-out`. The workflow
+# passes them as the named build context `x86ref`. Outputs are deleted at the end of the RUN, so the
+# layer stays small.
+FROM native-arm64 AS parity-arm64
+RUN --mount=type=bind,from=x86ref,target=/ref \
+    --mount=type=cache,id=exif-target,target=/src/target,sharing=locked \
+    --mount=type=cache,id=exif-corpus,target=/corpus,sharing=locked \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && sh tests/parity/fetch.sh /corpus \
+    && mkdir -p /work /out \
+    && sh tests/parity/inputs.sh /corpus /work/in 8 \
+    && echo "$(ls /work/in | wc -l) inputs" \
     && cargo build --locked --release --target aarch64-unknown-linux-gnu --example oracle \
-    && x=target/release/examples/oracle && a="qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/release/examples/oracle" \
-    && $x read /work/in /out/x.jsonl && $a read /work/in /out/a.jsonl \
-    && diff /out/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /out/x.jsonl) lines, identical" \
+    && a=target/aarch64-unknown-linux-gnu/release/examples/oracle \
+    && $a read /work/in /out/a.jsonl \
+    && diff /ref/x.jsonl /out/a.jsonl && echo "read: $(wc -l < /ref/x.jsonl) lines, identical" \
     && for m in all keep default orient1; do \
-         $x strip $m /work/in /out/x-$m && $a strip $m /work/in /out/a-$m \
-         && diff -r /out/x-$m /out/a-$m && diff /out/x-$m.errors /out/a-$m.errors \
-         && echo "strip $m: $(ls /out/x-$m | wc -l) files, identical" || exit 1; \
+         $a strip $m /work/in /out/a-$m \
+         && diff -r /ref/x-$m /out/a-$m && diff /ref/x-$m.errors /out/a-$m.errors \
+         && echo "strip $m: $(ls /ref/x-$m | wc -l) files, identical" || exit 1; \
        done \
     && rm -rf /out /work/in
 
