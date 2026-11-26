@@ -13,8 +13,15 @@ The job summary shows both and their ratio.
 
 ## Numbers
 
-Not measured yet. The first `bench.yml` run on `main` fills this table.
+Main 450c284, `bench.yml` run 45716804597, on a GitHub-hosted `ubuntu-24.04` runner (the baseline for
+later runs; information only).
 
-| Input class | Files | ExifTool 13.64 (ms/file) | exif-rs read (ms/file) | exif-rs strip (ms/file) |
-|---|---|---|---|---|
-| (placeholder) | | | | |
+| files | MB | read ms | strip ms |
+|---|---|---|---|
+| 2402 | 963.1 | 20.0 | 475.7 |
+
+| | wall ms |
+|---|---|
+| ExifTool `-j -n -G1 -a -r` | 4377 |
+| exif-rs `read` | 20.0 |
+| exif-rs `strip` (`Keep::default()`) | 475.7 |
